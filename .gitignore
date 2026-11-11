@@ -1,0 +1,11 @@
+# Local build artifacts
+/bin/
+/splitter
+
+# Local configuration file; use config.example.yaml as the template
+/config.yaml
+
+# Locally generated fuzz corpora
+**/testdata/fuzz/
+
+.DS_Store

@@ -1,0 +1,42 @@
+# 测试夹具，不是完整的域名列表。
+#
+# 该文件只用于 `make check-config`、单元测试与场景测试，用于验证示例配置可加载以及规则
+# 语义正确。实际部署所需的完整列表由使用者自行维护，不随本仓库发布。
+#
+# 格式与 v2fly/domain-list-community 一致：domain: 匹配自身与所有子域，full: 仅匹配自身。
+
+# domain: 条目，覆盖域名及其子域
+domain:baidu.com
+domain:qq.com
+domain:taobao.com
+domain:tmall.com
+domain:jd.com
+domain:bilibili.com
+domain:zhihu.com
+domain:weibo.com
+domain:163.com
+domain:126.com
+domain:aliyun.com
+domain:alipay.com
+domain:iqiyi.com
+domain:youku.com
+domain:douyin.com
+domain:xiaohongshu.com
+domain:meituan.com
+domain:dianping.com
+domain:ctrip.com
+domain:pinduoduo.com
+domain:cnblogs.com
+domain:csdn.net
+
+# full: 条目，仅精确匹配自身
+full:www.baidu.com
+full:www.qq.com
+full:api.weixin.qq.com
+full:mirrors.aliyun.com
+full:registry.npmmirror.com
+full:static.zhihu.com
+full:img.alicdn.com
+full:cdn.bcebos.com
+full:v.qq.com
+full:update.weixin.qq.com

@@ -1,0 +1,168 @@
+name: release
+
+# Publishes a release when a v* tag is pushed:
+#   1. runs the full test suite, so every release corresponds to a commit that
+#      passes it;
+#   2. cross-compiles linux/amd64, linux/arm64, darwin/amd64 and darwin/arm64
+#      binaries, generates sha256sums.txt and creates the GitHub Release;
+#   3. builds a linux/amd64 + linux/arm64 image and pushes it to
+#      ghcr.io/<owner>/splitter and, when Docker Hub credentials are configured,
+#      to docker.io. Tags: <version>, <major>.<minor>, <major>, and latest for
+#      releases that are not pre-releases.
+#
+# Repository configuration for Docker Hub (optional; skipped with a warning when
+# absent):
+#   secrets.DOCKERHUB_USERNAME, secrets.DOCKERHUB_TOKEN   push credentials
+#   vars.DOCKERHUB_REPOSITORY                             defaults to <owner>/splitter
+#
+# Publishing runs only on github.com; a mirror of this repository on another
+# forge does not publish.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - run: make test
+
+  github-release:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: build binaries and checksums
+        run: |
+          set -euo pipefail
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            make build-platform GOOS="${target%/*}" GOARCH="${target#*/}" \
+              VERSION="${GITHUB_REF_NAME}" COMMIT="${GITHUB_SHA::12}"
+          done
+          cp LICENSE bin/LICENSE
+          (cd bin && sha256sum splitter-* > sha256sums.txt)
+          ls -l bin
+      - name: create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY || format('{0}/splitter', github.repository_owner) }}
+          HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "## Container images"
+            echo
+            echo '```'
+            echo "ghcr.io/${owner}/splitter:${version}"
+            if [ "${HAS_DOCKERHUB}" = "true" ]; then
+              echo "docker.io/${DOCKERHUB_REPOSITORY}:${version}"
+            fi
+            echo '```'
+            echo
+            echo "## Binaries"
+            echo
+            echo "linux/amd64, linux/arm64, darwin/amd64 and darwin/arm64 binaries are attached;"
+            echo "verify them with \`sha256sum -c sha256sums.txt\`."
+            echo
+            echo "## Install with Go"
+            echo
+            echo '```'
+            echo "go install github.com/${GITHUB_REPOSITORY}/cmd/splitter@${tag}"
+            echo '```'
+          } > notes.md
+          prerelease=()
+          case "${tag}" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "${tag}" bin/splitter-* bin/sha256sums.txt bin/LICENSE \
+            --verify-tag --title "splitter ${version}" --notes-file notes.md \
+            --generate-notes "${prerelease[@]}"
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY || format('{0}/splitter', github.repository_owner) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: build metadata
+        id: build
+        run: echo "commit=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Docker Hub credentials
+        id: dockerhub
+        run: |
+          if [ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
+            echo "image=docker.io/${DOCKERHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are not set; the image is published to ghcr.io only"
+          fi
+      - if: steps.dockerhub.outputs.image != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository_owner }}/splitter
+            ${{ steps.dockerhub.outputs.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+          labels: |
+            org.opencontainers.image.title=splitter
+            org.opencontainers.image.licenses=GPL-3.0
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ steps.build.outputs.commit }}
+      - name: verify published image
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          docker run --rm "ghcr.io/${owner}/splitter:${{ steps.meta.outputs.version }}" -version

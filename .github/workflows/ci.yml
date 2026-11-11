@@ -1,0 +1,68 @@
+name: ci
+
+# Continuous integration. Runs on every push to main and on every pull request.
+#
+#   test   gofmt, go vet, race-enabled tests and example configuration
+#          validation (make test), followed by a short fuzz pass over the
+#          parsers and decoders. `go test` alone executes only the seed corpus.
+#   image  Builds the container image for linux/amd64 without publishing it,
+#          then verifies -version, -check against the example configuration,
+#          and the non-root user.
+#
+# Publishing (binaries, GitHub Release, container images) happens only in
+# release.yml, on v* tags. Both workflows run only on github.com; a mirror of
+# this repository on another forge does not run them.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: gofmt, race tests, vet, example config
+        run: make test
+      - name: fuzz smoke (20s each)
+        run: |
+          set -euo pipefail
+          go test -run '^$' -fuzz FuzzParseQuery -fuzztime 20s ./internal/wire
+          go test -run '^$' -fuzz FuzzServeDNS -fuzztime 20s ./internal/app
+          go test -run '^$' -fuzz FuzzLoad -fuzztime 20s ./internal/geosite
+          go test -run '^$' -fuzz FuzzRule -fuzztime 20s ./internal/domain
+
+  image:
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: build
+        run: docker build --tag splitter:ci --build-arg VERSION=ci --build-arg COMMIT="${GITHUB_SHA::12}" .
+      - name: self-check (example config)
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          cp config.example.yaml "${tmp}/config.yaml"
+          cp testdata/cn-domains.txt "${tmp}/cn-domains.txt"
+          # The image runs as nonroot (UID 65532); mktemp -d creates a 0700 directory.
+          chmod 0755 "${tmp}" && chmod 0644 "${tmp}"/*
+          docker run --rm splitter:ci -version
+          docker run --rm -v "${tmp}:/etc/splitter:ro" splitter:ci -check -config /etc/splitter/config.yaml
+          test "$(docker inspect -f '{{.Config.User}}' splitter:ci)" = "nonroot:nonroot"
