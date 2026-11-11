@@ -7,8 +7,10 @@ name: release
 #      binaries, generates sha256sums.txt and creates the GitHub Release;
 #   3. builds a linux/amd64 + linux/arm64 image and pushes it to
 #      ghcr.io/<owner>/splitter and, when Docker Hub credentials are configured,
-#      to docker.io. Tags: <version>, <major>.<minor>, <major>, and latest for
-#      releases that are not pre-releases.
+#      to docker.io. Tags: <version>, <major>.<minor>, <major>, and latest. A
+#      pre-release (a tag containing "-", such as v1.1.0-rc.1) receives only
+#      <version>. After the push, every tag is verified to resolve to the same
+#      image as <version>.
 #
 # Repository configuration for Docker Hub (optional; skipped with a warning when
 # absent):
@@ -119,8 +121,8 @@ jobs:
       - name: build metadata
         id: build
         run: echo "commit=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -134,35 +136,61 @@ jobs:
             echo "::warning::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are not set; the image is published to ghcr.io only"
           fi
       - if: steps.dockerhub.outputs.image != ''
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ env.DOCKERHUB_TOKEN }}
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: |
             ghcr.io/${{ github.repository_owner }}/splitter
             ${{ steps.dockerhub.outputs.image }}
+          # latest is listed explicitly instead of relying on the automatic
+          # flavor, so the rule is visible here: every release except a
+          # pre-release also moves latest. semver patterns other than
+          # {{version}} are skipped for pre-releases by the action.
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
           labels: |
             org.opencontainers.image.title=splitter
             org.opencontainers.image.licenses=GPL-3.0
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,scope=release,mode=max
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ github.ref_name }}
             COMMIT=${{ steps.build.outputs.commit }}
-      - name: verify published image
+      - name: verify published tags
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
+          # Every published tag must resolve to the same manifest as its
+          # repository's <version> tag; latest in particular must be identical.
+          digest() { docker buildx imagetools inspect --raw "$1" | sha256sum | cut -d' ' -f1; }
+          status=0
+          while IFS= read -r ref; do
+            [ -n "${ref}" ] || continue
+            pinned="${ref%:*}:${VERSION}"
+            if [ "$(digest "${ref}")" = "$(digest "${pinned}")" ]; then
+              echo "ok   ${ref} = ${pinned}"
+            else
+              echo "::error::${ref} does not resolve to the same image as ${pinned}"; status=1
+            fi
+          done <<< "${TAGS}"
           owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          docker run --rm "ghcr.io/${owner}/splitter:${{ steps.meta.outputs.version }}" -version
+          docker run --rm "ghcr.io/${owner}/splitter:${VERSION}" -version
+          exit "${status}"

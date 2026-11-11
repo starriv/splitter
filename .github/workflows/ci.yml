@@ -53,8 +53,24 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - name: build metadata
+        id: build
+        run: echo "commit=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      # The image is loaded into the local daemon for the self-check and never
+      # pushed. Layers are cached in the GitHub Actions cache across runs.
       - name: build
-        run: docker build --tag splitter:ci --build-arg VERSION=ci --build-arg COMMIT="${GITHUB_SHA::12}" .
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: splitter:ci
+          build-args: |
+            VERSION=ci
+            COMMIT=${{ steps.build.outputs.commit }}
+          cache-from: type=gha,scope=ci
+          cache-to: type=gha,scope=ci,mode=max
       - name: self-check (example config)
         run: |
           set -euo pipefail

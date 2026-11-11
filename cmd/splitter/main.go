@@ -31,11 +31,6 @@ import (
 	"github.com/starriv/splitter/internal/server"
 )
 
-var (
-	version = "dev"
-	commit  = "none"
-)
-
 func main() { os.Exit(run()) }
 
 func run() int {
@@ -45,6 +40,7 @@ func run() int {
 	healthcheck := flag.Bool("healthcheck", false, "probe the local admin /readyz endpoint and every bound DNS address, then exit (Docker HEALTHCHECK)")
 	adminFlag := flag.String("admin", "", "with -healthcheck: admin address to probe instead of the one in the config file")
 	flag.Parse()
+	resolveVersion()
 
 	if *showVersion {
 		fmt.Printf("splitter %s (%s)\n", version, commit)

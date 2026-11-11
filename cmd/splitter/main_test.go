@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"testing"
 	"time"
 
@@ -170,5 +171,31 @@ func TestProbeDNSRejectsNonDNS(t *testing.T) {
 	ap := netip.MustParseAddrPort(c.LocalAddr().String())
 	if err := probeDNS(ap, 500*time.Millisecond); err == nil {
 		t.Error("an echoed query was accepted as a DNS response")
+	}
+}
+
+// TestVersionFromBuildInfo verifies the fallback used when version and commit
+// were not set at link time, and that link-time values take precedence.
+func TestVersionFromBuildInfo(t *testing.T) {
+	installed := &debug.BuildInfo{Main: debug.Module{Version: "v1.2.3"}}
+	checkout := &debug.BuildInfo{Main: debug.Module{Version: "(devel)"}, Settings: []debug.BuildSetting{
+		{Key: "vcs.revision", Value: "9a477360aff02731e34edda693094d7f977f7435"},
+		{Key: "vcs.modified", Value: "true"},
+	}}
+	cases := []struct {
+		name         string
+		v, c         string
+		info         *debug.BuildInfo
+		wantV, wantC string
+	}{
+		{"go install", "dev", "none", installed, "v1.2.3", "none"},
+		{"git checkout", "dev", "none", checkout, "dev", "9a477360aff0-dirty"},
+		{"link-time values win", "v9.9.9", "abcdef123456", checkout, "v9.9.9", "abcdef123456"},
+		{"no build info", "dev", "none", nil, "dev", "none"},
+	}
+	for _, c := range cases {
+		if v, cm := versionFromBuildInfo(c.v, c.c, c.info); v != c.wantV || cm != c.wantC {
+			t.Errorf("%s: got %q %q, want %q %q", c.name, v, cm, c.wantV, c.wantC)
+		}
 	}
 }

@@ -155,6 +155,10 @@ splitter -healthcheck -config /etc/splitter/config.yaml
 splitter -version
 ```
 
+`-version` 输出版本号与提交号。发布的二进制与镜像在构建时注入两者；`go install …@vX.Y.Z`
+安装的二进制使用 Go 记录的模块版本；在 git 工作区中直接 `go build` 时使用 Go 记录的版本控制
+信息（工作区有未提交修改时带 `dirty` 标记）。
+
 进程信号：
 
 | 信号 | 行为 |
@@ -320,9 +324,13 @@ docker run --rm \
 | --- | --- |
 | `1.0.0` | 指定版本，内容不再变化 |
 | `1.0`、`1` | 对应系列的最新版本 |
-| `latest` | 最新的正式版本（不含预发布版本） |
+| `latest` | 最新的正式版本，与该版本的 `1.0.0` 等标签为同一镜像 |
 
-生产部署应固定完整版本号或镜像摘要。镜像同时发布到 `ghcr.io/starriv/splitter` 与
+每次正式发布同时推送以上全部标签；发布工作流在推送后校验每个标签与版本标签解析到同一镜像。
+预发布版本（如 `v1.1.0-rc.1`）只推送完整版本标签，不更新 `latest`、`1.1` 与 `1`。
+
+`docker pull ghcr.io/starriv/splitter:latest` 即可获得最新正式版本；需要可复现部署时应固定完整
+版本号或镜像摘要。镜像同时发布到 `ghcr.io/starriv/splitter` 与
 `docker.io/starriv/splitter`，两者内容一致。
 
 ## 发布与 CI

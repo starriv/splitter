@@ -6,7 +6,7 @@ GO ?= go
 GOFMT ?= gofmt
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo none)
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 
 .PHONY: all test test-unit vet fmt fmt-check bench check-config build build-linux build-platform clean
