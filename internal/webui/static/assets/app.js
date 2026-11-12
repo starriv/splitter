@@ -1,4 +1,4 @@
-// Control page for splitter. It communicates only with the same-origin
+// Control console for splitter. It communicates only with the same-origin
 // /api/v1 API (see internal/app/api.go).
 //
 // Domain names displayed on the page originate from queries issued by devices
@@ -10,18 +10,28 @@
 const STATE_INTERVAL = 5000;
 const RECENT_INTERVAL = 3000;
 const RECENT_LIMIT = 50;
+const PREVIEW_LIMIT = 8;
 const RATE_WINDOW = 60; // seconds over which the query rate and average latency are computed
 const LIST_STALE_DAYS = 14; // lists update weekly; 14 days without an update raises a warning
 const RULE_TONES = ["teal", "sky", "violet", "amber", "orchid"];
 const KIND_LABEL = { full: "完整匹配", domain: "域名及子域", keyword: "关键词", regexp: "正则" };
 const ERROR_LABEL = { timeout: "超时", network: "网络错误", mismatch: "应答不匹配", refused: "拒绝（REFUSED）", canceled: "已取消" };
 const ACTION_LABEL = { forward: "转发", answer: "本地应答", reject: "拒绝" };
+const RCODE_TONE = { NOERROR: "", NXDOMAIN: "amber", REFUSED: "amber", SERVFAIL: "danger" };
+const VIEWS = {
+  overview: { title: "概况", desc: "查询量、上游健康，以及需要处理的事项。" },
+  rules: { title: "分流规则", desc: "自上而下，第一条命中的生效。" },
+  upstreams: { title: "上游", desc: "一组内按顺序尝试，传输失败才换下一台。" },
+  sets: { title: "域名集合", desc: "列表文件由周更任务维护。" },
+  diagnose: { title: "路由诊断", desc: "查看路由不发送查询。实际解析会向上游发一条真实查询，并计入统计。" },
+  queries: { title: "最近查询", desc: "只保留经过规则求值的查询。前置解析器缓存命中的不会到这里。" },
+};
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 const $ = (id) => document.getElementById(id);
 
-// h creates an element. Keys in attrs other than class and dataset are
-// written as attributes; children may be nodes or strings.
+// h creates an element. Keys in attrs other than class are written as
+// attributes; children may be nodes or strings.
 function h(tag, attrs, ...children) {
   const el = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs || {})) {
@@ -46,6 +56,14 @@ function icon(name, size = 16) {
   use.setAttribute("href", "#i-" + name);
   svg.append(use);
   return svg;
+}
+
+// The face of a customizable select. The chevron is a real element because the
+// page CSP drops data-URI images, which is what made the previous arrow vanish.
+function selectFace() {
+  const mark = icon("chevron");
+  mark.classList.add("select-chevron");
+  return h("button", { type: "button" }, h("selectedcontent"), mark);
 }
 
 const badge = (text, tone, extra = "") => h("span", { class: `badge sm ${tone || ""} ${extra}`.trim() }, text);
@@ -119,7 +137,59 @@ const view = {
   ruleOptions: "",
 };
 
-const params = new URLSearchParams(location.search);
+let currentView = "overview";
+let pendingFocus = null;
+let closeDrawer = () => {};
+
+function knownView(name) {
+  return Object.hasOwn(VIEWS, name) ? name : "";
+}
+
+function viewFromLocation() {
+  const search = new URLSearchParams(location.search);
+  const named = knownView(search.get("view"));
+  if (named) return named;
+  if (search.get("name")) return "diagnose";
+  return "overview";
+}
+
+function viewHref(name) {
+  const next = new URLSearchParams(location.search);
+  next.delete("view");
+  if (name !== "overview") next.set("view", name);
+  const query = next.toString();
+  return query ? `?${query}` : location.pathname;
+}
+
+function updateNavLinks() {
+  for (const link of document.querySelectorAll("a[data-view]")) {
+    link.href = viewHref(link.dataset.view);
+  }
+}
+
+function applyRuleParam(rule) {
+  const select = $("f-rule");
+  const names = [...select.options].map((option) => option.value);
+  if (!rule || names.includes(rule)) {
+    select.value = rule || "";
+    delete select.dataset.pending;
+    return;
+  }
+  select.dataset.pending = rule;
+}
+
+// History navigation restores the form from the URL. The inputs are the source
+// syncURL writes back, so a restored address is lost if the fields stay stale.
+function restoreFromLocation() {
+  const search = new URLSearchParams(location.search);
+  $("f-q").value = search.get("q") || "";
+  applyRuleParam(search.get("rule") || "");
+  $("d-name").value = search.get("name") || "";
+  const type = (search.get("type") || "A").toUpperCase();
+  const typeSelect = $("d-type");
+  if ([...typeSelect.options].some((option) => option.value === type)) typeSelect.value = type;
+  showDiagnoseError("");
+}
 
 function syncURL() {
   const next = new URLSearchParams();
@@ -130,12 +200,61 @@ function syncURL() {
   }
   if ($("f-q").value.trim()) next.set("q", $("f-q").value.trim());
   if ($("f-rule").value) next.set("rule", $("f-rule").value);
+  if (currentView !== "overview") next.set("view", currentView);
   const query = next.toString();
   history.replaceState(null, "", query ? `?${query}` : location.pathname);
+  updateNavLinks();
+}
+
+function applyView(name) {
+  const next = knownView(name) || "overview";
+  currentView = next;
+  document.documentElement.dataset.view = next;
+  const meta = VIEWS[next];
+  $("page-title").textContent = meta.title;
+  $("page-desc").textContent = meta.desc;
+  document.title = `${meta.title} · DNS 分流器`;
+  for (const link of document.querySelectorAll(".side-nav a[data-view]")) {
+    if (link.dataset.view === next) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+}
+
+function navigate(name, options) {
+  const next = knownView(name);
+  if (!next) return;
+  const changed = next !== currentView;
+  const drawerOpen = $("drawer").hasAttribute("aria-modal");
+  if (changed) {
+    const url = new URL(location.href);
+    if (next === "overview") url.searchParams.delete("view");
+    else url.searchParams.set("view", next);
+    history.pushState({ view: next }, "", url);
+    updateNavLinks();
+    applyView(next);
+    if (next === "overview" || next === "queries") refreshRecent();
+  }
+  // A mouse click on the always-visible sidebar leaves focus where it is.
+  // Keyboard activation, and any click that closes the drawer, moves focus
+  // to the page title: the activating link is either about to be hidden or
+  // the view change would otherwise stay silent.
+  const moveFocus = !options || options.focus !== false;
+  if (drawerOpen) {
+    pendingFocus = $("page-title");
+    closeDrawer({ restoreFocus: false });
+  } else if (changed && moveFocus) {
+    $("page-title").focus({ preventScroll: true });
+  }
 }
 
 const ruleTone = (name) => view.tones.get(name) || "";
 const ruleBadge = (name) => badge(name, ruleTone(name));
+
+function rcodeBadge(rcode, count) {
+  const tone = rcode in RCODE_TONE ? RCODE_TONE[rcode] : "amber";
+  const text = count === undefined ? rcode : `${rcode} ${fmt.int(count)}`;
+  return badge(text, tone, tone ? "" : "outline");
+}
 
 // ── Status and overview ──────────────────────────────────────────────────────
 function renderStatus(status) {
@@ -147,15 +266,81 @@ function renderStatus(status) {
   $("status-text").textContent = text;
 }
 
-function renderFacts(status) {
+function versionText(status) {
+  return status.commit && status.commit !== "none" ? `${status.version} (${status.commit})` : status.version;
+}
+
+function prop(term, value) {
+  return h("div", null, h("dt", null, term), h("dd", null, value));
+}
+
+function renderRuntime(status) {
   const now = new Date(status.now);
-  $("fact-version").textContent = status.commit && status.commit !== "none" ? `${status.version} (${status.commit})` : status.version;
-  $("fact-listen").textContent = status.listen.join("、");
-  $("fact-uptime").textContent = fmt.duration((now - new Date(status.started_at)) / 1000);
   const loaded = new Date(status.loaded_at);
-  $("fact-loaded").textContent = `${fmt.dateTime(loaded)}（${fmt.relative(loaded, now)}）`;
-  $("fact-loaded").title = fmt.full(loaded);
-  $("facts").hidden = false;
+  const version = versionText(status);
+  const listen = (status.listen || []).join("、");
+  $("runtime").replaceChildren(
+    prop("版本", h("code", null, version)),
+    prop("监听", h("code", null, listen)),
+    prop("管理端口", h("code", null, status.admin)),
+    prop("已运行", fmt.duration((now - new Date(status.started_at)) / 1000)),
+    prop("配置加载于", h("span", { title: fmt.full(loaded) }, `${fmt.dateTime(loaded)}（${fmt.relative(loaded, now)}）`)),
+    prop("日志", status.log_queries ? `${status.log_level}，记录查询` : `${status.log_level}，不记录查询`),
+    prop("在途查询", `${fmt.int(status.inflight)} / ${fmt.int(status.max_inflight)}`),
+    prop("TCP 连接", `${fmt.int(status.tcp_connections)} / ${fmt.int(status.max_tcp_conns)}`),
+    prop("本地拒绝", fmt.int(status.refused_locally)),
+    prop("畸形查询", fmt.int(status.malformed)),
+    prop("成功重载", fmt.int(status.reloads_ok)),
+    prop("被拒重载", fmt.int(status.reloads_failed)),
+  );
+  $("meta-version").textContent = version;
+  $("meta-listen").textContent = listen;
+}
+
+function renderRcodes(rcodes) {
+  const entries = Object.entries(rcodes || {}).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]);
+  const el = $("rcodes");
+  if (!entries.length) {
+    el.hidden = true;
+    el.replaceChildren();
+    return;
+  }
+  el.hidden = false;
+  el.replaceChildren(
+    h("span", { class: "rcodes-label" }, "应答码"),
+    ...entries.map(([code, n]) => rcodeBadge(code, n)));
+}
+
+function attentionRow(tone, label, text) {
+  return h("div", { class: "attn" }, badge(label, tone), h("p", null, text));
+}
+
+function renderAttention(data) {
+  const items = [];
+  const now = new Date(data.status.now);
+  for (const group of data.upstreams) {
+    for (const server of group.servers) {
+      if (!server.penalized) continue;
+      items.push(attentionRow("warning", "惩罚中", `${group.name} 的 ${server.addr} 连续失败，暂排在其他服务器之后。`));
+    }
+  }
+  for (const set of data.sets) {
+    for (const source of set.sources) {
+      const modified = new Date(source.modified);
+      if (modified.getUTCFullYear() <= 1970) continue;
+      const days = (now - modified) / 86400000;
+      if (days > LIST_STALE_DAYS) {
+        items.push(attentionRow("warning", "列表过期", `${set.name} 的 ${source.file} 已 ${Math.floor(days)} 天没有更新。`));
+      }
+    }
+  }
+  if (data.status.overload_dropped > 0) {
+    items.push(attentionRow("danger", "过载", `丢弃了 ${fmt.int(data.status.overload_dropped)} 条查询或连接，已达到并发上限。`));
+  }
+  if (data.status.write_errors > 0) {
+    items.push(attentionRow("warning", "写回失败", `${fmt.int(data.status.write_errors)} 次应答已生成但没有写回客户端。`));
+  }
+  $("attention").replaceChildren(...(items.length ? items : [h("p", { class: "empty-note" }, "没有需要处理的事项。")]));
 }
 
 function renderAlerts() {
@@ -263,6 +448,12 @@ function emptyRow(columns, text) {
   return h("tr", null, h("td", { colspan: columns, class: "empty" }, text));
 }
 
+function fillEmpty(id, text) {
+  const table = $(id);
+  if (!table || !table.tBodies || !table.tHead.rows.length) return;
+  table.tBodies[0].replaceChildren(emptyRow(table.tHead.rows[0].cells.length, text));
+}
+
 function averageMs(seconds, count) {
   return count > 0 ? fmt.ms(seconds / count * 1000) : "—";
 }
@@ -291,8 +482,22 @@ function shareCell(ratio) {
     h("span", { class: "share-text" }, fmt.percent(ratio)));
 }
 
-function renderRules(data) {
+function rememberRules(data) {
   view.tones = new Map(data.rules.map((rule, index) => [rule.name, RULE_TONES[index % RULE_TONES.length]]));
+  const names = data.rules.map((rule) => rule.name);
+  const signature = names.join("\n");
+  if (signature === view.ruleOptions) return;
+  view.ruleOptions = signature;
+  const select = $("f-rule");
+  const wanted = select.dataset.pending || select.value;
+  delete select.dataset.pending;
+  let button = select.querySelector("button");
+  if (!button || !button.querySelector(".select-chevron")) button = selectFace();
+  select.replaceChildren(button, h("option", { value: "" }, "全部规则"), ...names.map((name) => h("option", { value: name }, name)));
+  select.value = names.includes(wanted) ? wanted : "";
+}
+
+function renderRules(data) {
   const total = data.status.queries;
   $("rules").tBodies[0].replaceChildren(...data.rules.map((rule, index) =>
     h("tr", null,
@@ -303,41 +508,71 @@ function renderRules(data) {
       h("td", { class: "num" }, fmt.int(rule.queries)),
       h("td", null, shareCell(total > 0 ? rule.queries / total : 0)),
       h("td", { class: "num" }, averageMs(rule.duration_seconds, rule.queries)))));
+}
 
-  // The filter select follows the rule list. It is left untouched while the
-  // rule list is unchanged, so an open dropdown is not interrupted.
-  const names = data.rules.map((rule) => rule.name);
-  const signature = names.join("\n");
-  if (signature !== view.ruleOptions) {
-    view.ruleOptions = signature;
-    const select = $("f-rule");
-    const wanted = select.dataset.pending || select.value;
-    delete select.dataset.pending;
-    select.replaceChildren(h("option", { value: "" }, "全部规则"), ...names.map((name) => h("option", { value: name }, name)));
-    select.value = names.includes(wanted) ? wanted : "";
-  }
+function renderOverviewRules(data) {
+  const total = data.status.queries;
+  const rows = data.rules.map((rule, index) =>
+    h("tr", null,
+      h("td", { class: "num" }, index + 1),
+      h("td", null, ruleBadge(rule.name)),
+      h("td", { class: "num" }, fmt.int(rule.queries)),
+      h("td", null, shareCell(total > 0 ? rule.queries / total : 0))));
+  $("overview-rules").tBodies[0].replaceChildren(...(rows.length ? rows : [emptyRow(4, "配置里没有规则。")]));
+}
+
+function serverCells(server) {
+  const failed = Object.values(server.errors).reduce((sum, n) => sum + n, 0);
+  const reasons = Object.entries(server.errors).filter(([, n]) => n > 0)
+    .map(([reason, n]) => `${ERROR_LABEL[reason] || reason} ${fmt.int(n)}`).join("，");
+  return [
+    h("td", { class: "nowrap" }, h("code", null, server.addr),
+      server.penalized ? h("span", { class: "sub" }, "连续失败，暂排在其他服务器之后") : null),
+    h("td", { class: "num" }, fmt.int(server.requests)),
+    h("td", { class: "num" }, fmt.int(failed), reasons ? h("span", { class: "sub" }, reasons) : null),
+    h("td", { class: "num" }, fmt.int(server.retransmits)),
+    h("td", { class: "num" }, averageMs(server.duration_seconds, server.succeeded)),
+  ];
+}
+
+function upstreamSection(group, index) {
+  const titleId = `upstream-title-${index}`;
+  return h("section", { class: "section", "data-upstream": group.name, "aria-labelledby": titleId },
+    h("div", { class: "section-head" },
+      h("h2", { id: titleId }, h("code", null, group.name)),
+      h("p", { class: "muted" }, `单次超时 ${oneDecimal.format(group.timeout_seconds)} 秒`)),
+    h("div", { class: "table-wrap", tabindex: "0", role: "region", "aria-labelledby": titleId },
+      h("table", { class: "table" },
+        h("thead", null, h("tr", null,
+          h("th", { scope: "col" }, "服务器"),
+          h("th", { scope: "col", class: "num" }, "请求"),
+          h("th", { scope: "col", class: "num" }, "失败"),
+          h("th", { scope: "col", class: "num" }, "重发"),
+          h("th", { scope: "col", class: "num" }, "平均耗时"))),
+        h("tbody", null, group.servers.map((server) => h("tr", null, ...serverCells(server)))))));
 }
 
 function renderUpstreams(data) {
-  const rows = [];
-  for (const group of data.upstreams) {
-    group.servers.forEach((server, index) => {
-      const failed = Object.values(server.errors).reduce((sum, n) => sum + n, 0);
-      const reasons = Object.entries(server.errors).filter(([, n]) => n > 0)
-        .map(([reason, n]) => `${ERROR_LABEL[reason] || reason} ${fmt.int(n)}`).join("，");
-      rows.push(h("tr", null,
-        index === 0 ? h("td", { rowspan: group.servers.length },
-          h("code", null, group.name),
-          h("span", { class: "sub" }, `单次超时 ${oneDecimal.format(group.timeout_seconds)} 秒`)) : null,
-        h("td", { class: "nowrap" }, h("code", null, server.addr),
-          server.penalized ? h("span", { class: "sub" }, "连续失败，暂排在其他服务器之后") : null),
-        h("td", { class: "num" }, fmt.int(server.requests)),
-        h("td", { class: "num" }, fmt.int(failed), reasons ? h("span", { class: "sub" }, reasons) : null),
-        h("td", { class: "num" }, fmt.int(server.retransmits)),
-        h("td", { class: "num" }, averageMs(server.duration_seconds, server.succeeded))));
-    });
+  const host = $("upstreams");
+  if (!data.upstreams.length) {
+    delete host.dataset.groups;
+    host.replaceChildren(h("p", { class: "empty-note" }, "配置里没有上游：所有规则都在本地应答或拒绝。"));
+    return;
   }
-  $("upstreams").tBodies[0].replaceChildren(...(rows.length ? rows : [emptyRow(6, "配置里没有上游：所有规则都在本地应答或拒绝。")]));
+  // Rebuilding the scrollport on every poll drops scroll position and focus.
+  // Same group names keep the existing sections and only replace the rows.
+  const signature = data.upstreams.map((group) => group.name).join("\n");
+  if (host.dataset.groups !== signature) {
+    host.dataset.groups = signature;
+    host.replaceChildren(...data.upstreams.map(upstreamSection));
+    return;
+  }
+  data.upstreams.forEach((group, index) => {
+    const section = host.children[index];
+    section.querySelector(".muted").textContent = `单次超时 ${oneDecimal.format(group.timeout_seconds)} 秒`;
+    section.querySelector("tbody").replaceChildren(
+      ...group.servers.map((server) => h("tr", null, ...serverCells(server))));
+  });
 }
 
 function sourceLine(source, now) {
@@ -368,16 +603,27 @@ function renderSets(data) {
 
 function render() {
   const data = view.data;
-  $("kpis").closest(".shell").toggleAttribute("data-stale", Boolean(view.connectionError));
+  $("workspace").toggleAttribute("data-stale", Boolean(view.connectionError));
   renderAlerts();
   if (!data) {
     renderStatus({ ready: true });
+    if (view.connectionError) {
+      const text = "暂时读不到数据。";
+      for (const id of ["rules", "sets", "recent", "overview-rules", "overview-recent"]) fillEmpty(id, text);
+      $("upstreams").replaceChildren(h("p", { class: "empty-note" }, text));
+      $("runtime").replaceChildren(prop("状态", text));
+      $("attention").replaceChildren(h("p", { class: "empty-note" }, text));
+    }
     return;
   }
   renderStatus(data.status);
-  renderFacts(data.status);
+  renderRuntime(data.status);
+  renderRcodes(data.status.rcodes);
+  renderAttention(data);
   renderKPIs(data);
+  rememberRules(data);
   renderRules(data);
+  renderOverviewRules(data);
   renderUpstreams(data);
   renderSets(data);
 }
@@ -390,22 +636,30 @@ async function refreshState() {
     pushSample(data);
   } catch (error) {
     view.connectionError = error.message;
-    if (!view.data) {
-      for (const id of ["rules", "upstreams", "sets"]) {
-        const table = $(id);
-        table.tBodies[0].replaceChildren(emptyRow(table.tHead.rows[0].cells.length, "暂时读不到数据。"));
-      }
-    }
   }
   render();
 }
 
 // ── Recent queries ───────────────────────────────────────────────────────────
-const RCODE_TONE = { NOERROR: "", NXDOMAIN: "amber", REFUSED: "amber", SERVFAIL: "danger" };
-
-function rcodeBadge(rcode) {
-  const tone = rcode in RCODE_TONE ? RCODE_TONE[rcode] : "amber";
-  return badge(rcode, tone, tone ? "" : "outline");
+function queryRow(record, compact) {
+  const at = new Date(record.time);
+  const how = record.set ? `集合 ${record.set}，${KIND_LABEL[record.match] || record.match}` : "未命中任何集合";
+  if (compact) {
+    return h("tr", null,
+      h("td", { class: "time", title: fmt.full(at) }, fmt.clock(at)),
+      h("td", { class: "name" }, h("code", null, record.name || ".")),
+      h("td", null, ruleBadge(record.rule)),
+      h("td", null, h("div", { class: "chips" }, rcodeBadge(record.rcode), record.truncated ? badge("已截断", "", "outline") : null)),
+      h("td", { class: "num" }, fmt.ms(record.duration_ms)));
+  }
+  return h("tr", null,
+    h("td", { class: "time", title: fmt.full(at) }, fmt.clock(at)),
+    h("td", { class: "name" }, h("code", null, record.name || ".")),
+    h("td", null, record.type),
+    h("td", null, ruleBadge(record.rule)),
+    h("td", { class: "nowrap", title: how }, h("code", null, record.target)),
+    h("td", null, h("div", { class: "chips" }, rcodeBadge(record.rcode), record.truncated ? badge("已截断", "", "outline") : null)),
+    h("td", { class: "num" }, fmt.ms(record.duration_ms)));
 }
 
 async function refreshRecent() {
@@ -418,31 +672,29 @@ async function refreshRecent() {
   try {
     data = await api(`/api/v1/queries?${query}`);
   } catch (error) {
-    // Connection problems are reported by the banner at the top, so the previous
-    // rows are kept here.
-    if (!$("recent").dataset.loaded) $("recent").tBodies[0].replaceChildren(emptyRow(7, "暂时读不到数据。"));
+    if (!$("recent").dataset.loaded) {
+      fillEmpty("recent", "暂时读不到数据。");
+      fillEmpty("overview-recent", "暂时读不到数据。");
+    }
     return;
   }
   $("recent").dataset.loaded = "true";
-  const rows = data.queries.map((record) => {
-    const at = new Date(record.time);
-    const how = record.set ? `集合 ${record.set}，${KIND_LABEL[record.match] || record.match}` : "未命中任何集合";
-    return h("tr", null,
-      h("td", { class: "time", title: fmt.full(at) }, fmt.clock(at)),
-      h("td", { class: "name" }, h("code", null, record.name || ".")),
-      h("td", null, record.type),
-      h("td", null, ruleBadge(record.rule)),
-      h("td", { class: "nowrap", title: how }, h("code", null, record.target)),
-      h("td", null, h("div", { class: "chips" }, rcodeBadge(record.rcode), record.truncated ? badge("已截断", "", "outline") : null)),
-      h("td", { class: "num" }, fmt.ms(record.duration_ms)));
-  });
+  const rows = data.queries.map((record) => queryRow(record, false));
+  const preview = data.queries.slice(0, PREVIEW_LIMIT).map((record) => queryRow(record, true));
   if (!rows.length) {
-    rows.push(emptyRow(7, q || rule
+    const empty = q || rule
       ? "没有符合筛选条件的查询。清空筛选条件可以看到全部。"
-      : "还没有查询经过分流器。在上面的「路由诊断」里做一次实际解析，或等客户端发起查询。"));
+      : "还没有查询经过分流器。在「路由诊断」里做一次实际解析，或等客户端发起查询。";
+    rows.push(emptyRow(7, empty));
+    preview.push(emptyRow(5, q || rule ? "没有符合筛选条件的查询。" : "还没有查询经过分流器。"));
   }
   $("recent").tBodies[0].replaceChildren(...rows);
+  $("overview-recent").tBodies[0].replaceChildren(...preview);
   $("recent-note").textContent = `只在内存里保留最近 ${fmt.int(data.capacity)} 条，这里显示最新的 ${RECENT_LIMIT} 条。AdGuard 缓存命中的查询不会到达分流器。`;
+  const filtered = Boolean(q || rule);
+  const note = $("overview-recent-note");
+  note.textContent = filtered ? "已按最近查询页的筛选条件显示。" : "";
+  note.hidden = !filtered;
 }
 
 function setPaused(paused) {
@@ -474,7 +726,7 @@ function resultGrid(route, resolved) {
 }
 
 function answersTable(answers) {
-  return h("div", { class: "table-wrap" },
+  return h("div", { class: "table-wrap", tabindex: "0", role: "region", "aria-label": "应答记录" },
     h("table", { class: "table" },
       h("thead", null, h("tr", null,
         h("th", { scope: "col" }, "名称"), h("th", { scope: "col" }, "类型"),
@@ -581,11 +833,155 @@ function toggleTheme() {
   applyThemeControl();
 }
 
+// ── Navigation drawer ────────────────────────────────────────────────────────
+// Below 960px the sidebar is a popover drawer. Wide layout removes the popover
+// and the dialog role so the same element is a normal sidebar.
+function setupDrawer() {
+  const drawer = $("drawer");
+  const scroller = drawer.querySelector(".drawer-scroller");
+  const sheet = drawer.querySelector(".drawer-sheet");
+  const openBtn = $("nav-open");
+  const closeBtn = $("nav-close");
+  const workspace = $("workspace");
+  const popoverOK = Object.hasOwn(HTMLElement.prototype, "popover");
+  const layoutQuery = matchMedia("(min-width: 960px)");
+  let suppressClose = false;
+  let closeTimer = 0;
+  let restoreFocus = true;
+
+  function wide() { return layoutQuery.matches; }
+
+  function setBackgroundInert(on) {
+    workspace.inert = on;
+    $("skip").inert = on;
+    $("toasts").inert = on;
+  }
+
+  function finishClose() {
+    if (!drawer.hasAttribute("aria-modal")) return;
+    drawer.removeAttribute("aria-modal");
+    clearTimeout(closeTimer);
+    suppressClose = false;
+    if (popoverOK && drawer.matches(":popover-open")) drawer.hidePopover();
+    setBackgroundInert(false);
+    openBtn.setAttribute("aria-expanded", "false");
+    const target = pendingFocus;
+    pendingFocus = null;
+    if (target) target.focus({ preventScroll: true });
+    else if (restoreFocus) openBtn.focus({ preventScroll: true });
+  }
+
+  function syncLayout() {
+    if (wide()) {
+      if (drawer.hasAttribute("aria-modal")) finishClose();
+      if (popoverOK && drawer.matches(":popover-open")) drawer.hidePopover();
+      drawer.removeAttribute("popover");
+      drawer.removeAttribute("role");
+      drawer.removeAttribute("aria-label");
+      document.documentElement.dataset.layout = "wide";
+      return;
+    }
+    document.documentElement.dataset.layout = "narrow";
+    if (!popoverOK) return;
+    if (!drawer.hasAttribute("popover")) drawer.setAttribute("popover", "manual");
+    drawer.setAttribute("role", "dialog");
+    drawer.setAttribute("aria-label", "控制台导航");
+  }
+
+  async function openDrawer() {
+    if (wide() || !popoverOK) return;
+    syncLayout();
+    suppressClose = true;
+    restoreFocus = true;
+    drawer.showPopover();
+    setBackgroundInert(true);
+    drawer.setAttribute("aria-modal", "true");
+    openBtn.setAttribute("aria-expanded", "true");
+    if (!CSS.supports("scroll-initial-target", "nearest")) {
+      scroller.scrollTo({ left: scroller.offsetWidth, behavior: "instant" });
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    }
+    scroller.scrollTo({ left: 0, behavior: "auto" });
+    closeBtn.focus({ preventScroll: true });
+  }
+
+  closeDrawer = function (options) {
+    if (!drawer.hasAttribute("aria-modal")) return;
+    restoreFocus = !options || options.restoreFocus !== false;
+    scroller.scrollTo({ left: scroller.offsetWidth, behavior: "auto" });
+    clearTimeout(closeTimer);
+    closeTimer = setTimeout(() => {
+      if (drawer.hasAttribute("aria-modal")) finishClose();
+    }, 700);
+  };
+
+  const visibleThreshold = 1 / Math.max(window.innerWidth, 1);
+  const observer = new IntersectionObserver((entries) => {
+    if (wide()) return;
+    const entry = entries.at(-1);
+    if (!entry) return;
+    if (entry.intersectionRatio === 1) {
+      suppressClose = false;
+      openBtn.setAttribute("aria-expanded", "true");
+      return;
+    }
+    if (suppressClose || !drawer.hasAttribute("aria-modal")) return;
+    if (entry.intersectionRatio < visibleThreshold) finishClose();
+  }, { root: drawer, threshold: [Math.min(visibleThreshold, 0.99), 1] });
+  observer.observe(sheet);
+
+  if (!CSS.supports("animation-timeline", "scroll()")) {
+    scroller.addEventListener("scroll", () => {
+      const width = sheet.offsetWidth || 1;
+      const ratio = 1 - scroller.scrollLeft / width;
+      drawer.style.setProperty("--drawer-backdrop", String(Math.min(1, Math.max(0, ratio))));
+    }, { passive: true });
+  }
+
+  openBtn.addEventListener("click", openDrawer);
+  closeBtn.addEventListener("click", () => closeDrawer());
+  drawer.addEventListener("click", (event) => {
+    if (!sheet.contains(event.target)) closeDrawer();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && drawer.hasAttribute("aria-modal")) {
+      event.preventDefault();
+      closeDrawer();
+    }
+  });
+  layoutQuery.addEventListener("change", syncLayout);
+  syncLayout();
+}
+
 // ── Startup ──────────────────────────────────────────────────────────────────
 function start() {
+  setupDrawer();
   applyThemeControl();
+  applyView(viewFromLocation());
+  updateNavLinks();
   $("theme").addEventListener("click", toggleTheme);
   $("reload").addEventListener("click", reloadConfig);
+
+  document.addEventListener("click", (event) => {
+    const link = event.target.closest("a[data-view]");
+    if (!link || event.defaultPrevented || event.button !== 0) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    navigate(link.dataset.view, { focus: event.detail === 0 });
+  });
+  addEventListener("popstate", () => {
+    if ($("drawer").hasAttribute("aria-modal")) {
+      pendingFocus = $("page-title");
+      closeDrawer({ restoreFocus: false });
+    }
+    restoreFromLocation();
+    updateNavLinks();
+    const next = viewFromLocation();
+    applyView(next);
+    if (next === "overview" || next === "queries") refreshRecent();
+    if (next === "diagnose" && $("d-name").value.trim()) diagnose(false);
+    else $("d-result").hidden = true;
+  });
 
   $("diagnose").addEventListener("submit", (event) => { event.preventDefault(); diagnose(false); });
   $("d-resolve").addEventListener("click", () => diagnose(true));
@@ -601,19 +997,18 @@ function start() {
   $("f-pause").addEventListener("click", () => setPaused(!view.paused));
 
   // Filters and diagnosis input are stored in the URL so that the view can be
-  // bookmarked or shared.
-  $("f-q").value = params.get("q") || "";
-  if (params.get("rule")) $("f-rule").dataset.pending = params.get("rule");
-  $("d-name").value = params.get("name") || "";
-  const type = (params.get("type") || "A").toUpperCase();
-  if ([...$("d-type").options].some((option) => option.value === type)) $("d-type").value = type;
+  // bookmarked or shared. A name without an explicit view opens the diagnosis.
+  restoreFromLocation();
 
   refreshState().then(() => {
     refreshRecent();
-    if ($("d-name").value) diagnose(false);
+    if ($("d-name").value && currentView === "diagnose") diagnose(false);
   });
   setInterval(() => { if (!document.hidden) refreshState(); }, STATE_INTERVAL);
-  setInterval(() => { if (!document.hidden && !view.paused) refreshRecent(); }, RECENT_INTERVAL);
+  setInterval(() => {
+    if (document.hidden || view.paused) return;
+    if (currentView === "overview" || currentView === "queries") refreshRecent();
+  }, RECENT_INTERVAL);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;
     refreshState();

@@ -1,11 +1,20 @@
-// Apply the theme before first paint: the stored preference wins,
-// otherwise the system preference applies. Loaded synchronously from
-// <head>.
+// Apply the theme, layout and view before first paint. The stored theme
+// wins, otherwise the system preference applies. Loaded synchronously from
+// <head>. The view and layout are mirrored in CSS so the first paint matches
+// the URL without waiting for the deferred page script.
 (function () {
   var theme = null;
   try { theme = localStorage.getItem("splitter-theme"); } catch (e) {}
   if (theme !== "light" && theme !== "dark") {
     theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   }
-  document.documentElement.dataset.theme = theme;
+  var root = document.documentElement;
+  root.dataset.theme = theme;
+  root.dataset.layout = matchMedia("(min-width: 960px)").matches ? "wide" : "narrow";
+
+  var params = new URLSearchParams(location.search);
+  var view = params.get("view");
+  if (!view && params.get("name")) view = "diagnose";
+  var known = { overview: 1, rules: 1, upstreams: 1, sets: 1, diagnose: 1, queries: 1 };
+  root.dataset.view = known[view] ? view : "overview";
 })();
