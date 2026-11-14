@@ -3,7 +3,7 @@
 # 该文件用于本地运行、`make check-config` 与 `splitter -check`。生产配置应由部署系统
 # 按实际环境生成，并以只读方式挂载到容器内的 /etc/splitter/config.yaml。
 #
-# 配置分为监听、管理端点、日志、资源限制、上游组、域名集合与有序规则七部分：
+# 配置分为监听、管理端点、日志、资源限制、可观测性、上游组、域名集合与有序规则八部分：
 #   - listen / admin 仅允许回环地址；
 #   - upstreams 的服务器地址必须为 IP 字面量；
 #   - rules 自上而下求值，首条命中生效，最后一条必须覆盖所有剩余查询。
@@ -20,7 +20,19 @@ admin: 127.0.0.1:9198
 
 log:
   level: info
+  # 向标准错误逐条输出查询（info 级别）。与下方查询日志相互独立。
   queries: false
+  # 日志目录，省略时为 /var/log/splitter。相对路径按本文件所在目录解析。
+  # 查询日志开启时，该目录无法创建或不可写则拒绝启动。
+  dir: /var/log/splitter
+  # 查询日志：应答过的每条查询（含本地拒绝的无效查询）以 JSON Lines 写入 dir，
+  # 控制面板「最近查询」从这里分页读取。
+  query_log:
+    enabled: true
+    # 全部查询日志文件的总上限（MiB），超出后从最旧的文件开始删除。
+    max_size_mb: 4096
+    # 保留时长（30 天），超过的文件被删除。
+    max_age: 720h
 
 limits:
   # 同时处理的查询数上限，取值 1–16384；超限查询被丢弃并计入 splitter_overload_dropped_total。
@@ -31,6 +43,15 @@ limits:
   tcp_idle_timeout: 10s
   # 热加载时集合条目允许的最大收缩比例，用于拒绝被截断的列表。
   max_set_shrink: 0.5
+
+# 可观测性页（可选）：从 Prometheus 读回 splitter 自己的指标，按 Grafana 的口径
+# 画成曲线。未配置时页面只显示启用方法，不发出任何请求。
+# 修改后热加载即可生效，不需要重启。
+# observability:
+#   prometheus_url: http://127.0.0.1:9090
+#   job: splitter
+#   dashboard_url: https://grafana.example/d/dns-quality/
+#   timeout: 8s
 
 upstreams:
   # 示例：一组区域解析器与一组公共解析器。实际部署按网络环境配置。

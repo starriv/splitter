@@ -2,17 +2,21 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 
 	"github.com/starriv/splitter/internal/dnstest"
+	"github.com/starriv/splitter/internal/observability"
 )
 
 // call builds a request and serves it through h, returning the recorded
@@ -124,45 +128,107 @@ func TestAPIState(t *testing.T) {
 	}
 }
 
-// TestAPIQueries verifies the queries endpoint: newest-first order,
-// substring and rule filters, and validation of the limit parameter.
+// TestAPIQueries verifies the queries endpoint from both sources:
+// newest-first order, substring and rule filters, and validation of the limit
+// parameter.
 func TestAPIQueries(t *testing.T) {
+	for _, source := range []string{"disk", "memory"} {
+		t.Run(source, func(t *testing.T) {
+			e := start(t, source == "memory")
+			h := e.app.AdminHandler()
+			for _, n := range []string{"www.baidu.com.", "www.google.com.", "home.local.example.", "tieba.baidu.com."} {
+				e.ask(t, "udp", n, dnsmessage.TypeA)
+			}
+
+			all := decode[QueryPage](t, call(t, h, "GET", "/api/v1/queries", "", nil))
+			if all.Total != 4 || all.Source != source || len(all.Queries) != 4 || all.Next != "" {
+				t.Fatalf("queries = %+v", all)
+			}
+			if (source == "memory") != (all.Capacity == recentCapacity) {
+				t.Errorf("capacity %d for %s", all.Capacity, source)
+			}
+			// Newest first.
+			wantSeq := uint64(4)
+			if source == "disk" {
+				wantSeq = 0 // sequence numbers are not stored on disk
+			}
+			if q := all.Queries[0]; q.Name != "tieba.baidu.com" || q.Rule != "cn" || q.Set != "cn" || q.Match != "domain" ||
+				q.Target != "aliyun" || q.RCode != "NOERROR" || q.Type != "A" || q.Proto != "udp" || q.Seq != wantSeq {
+				t.Errorf("newest = %+v", q)
+			}
+			if q := all.Queries[2]; q.Name != "www.google.com" || q.Rule != "default" || q.Set != "" || q.Match != "" {
+				t.Errorf("catch-all entry = %+v", q)
+			}
+
+			byName := decode[QueryPage](t, call(t, h, "GET", "/api/v1/queries?q=BAIDU", "", nil))
+			if len(byName.Queries) != 2 {
+				t.Errorf("q=BAIDU -> %+v", byName.Queries)
+			}
+			// "cn" occurs in other fields of every cn record; only names count.
+			if got := decode[QueryPage](t, call(t, h, "GET", "/api/v1/queries?q=aliyun", "", nil)); len(got.Queries) != 0 {
+				t.Errorf("q=aliyun matched a non-name field: %+v", got.Queries)
+			}
+			byRule := decode[QueryPage](t, call(t, h, "GET", "/api/v1/queries?rule=local-zone&limit=1", "", nil))
+			if len(byRule.Queries) != 1 || byRule.Queries[0].Name != "home.local.example" {
+				t.Errorf("rule=local-zone -> %+v", byRule.Queries)
+			}
+			for _, bad := range []string{"0", "-1", "x", "513"} {
+				if rec := call(t, h, "GET", "/api/v1/queries?limit="+bad, "", nil); rec.Code != http.StatusBadRequest {
+					t.Errorf("limit=%s: %d", bad, rec.Code)
+				}
+			}
+			if rec := call(t, h, "GET", "/api/v1/queries?cursor=../../etc/passwd@0", "", nil); rec.Code != http.StatusBadRequest {
+				t.Errorf("bad cursor: %d", rec.Code)
+			}
+		})
+	}
+}
+
+// TestAPIQueriesPaging verifies that "next" walks the on-disk log back to the
+// first query without repeating or skipping one, with and without a filter.
+func TestAPIQueriesPaging(t *testing.T) {
 	e := start(t)
 	h := e.app.AdminHandler()
-	for _, n := range []string{"www.baidu.com.", "www.google.com.", "home.local.example.", "tieba.baidu.com."} {
-		e.ask(t, "udp", n, dnsmessage.TypeA)
+	const n = 25
+	for i := range n {
+		e.ask(t, "udp", fmt.Sprintf("p%02d.baidu.com.", i), dnsmessage.TypeA)
+		e.ask(t, "udp", fmt.Sprintf("p%02d.example.org.", i), dnsmessage.TypeA)
 	}
-	type resp struct {
-		Queries  []QueryRecord `json:"queries"`
-		Total    uint64        `json:"total"`
-		Capacity int           `json:"capacity"`
-	}
-
-	all := decode[resp](t, call(t, h, "GET", "/api/v1/queries", "", nil))
-	if all.Total != 4 || all.Capacity != recentCapacity || len(all.Queries) != 4 {
-		t.Fatalf("queries = %+v", all)
-	}
-	// Newest first.
-	if q := all.Queries[0]; q.Name != "tieba.baidu.com" || q.Rule != "cn" || q.Set != "cn" || q.Match != "domain" ||
-		q.Target != "aliyun" || q.RCode != "NOERROR" || q.Type != "A" || q.Proto != "udp" || q.Seq != 4 {
-		t.Errorf("newest = %+v", q)
-	}
-	if q := all.Queries[2]; q.Name != "www.google.com" || q.Rule != "default" || q.Set != "" || q.Match != "" {
-		t.Errorf("catch-all entry = %+v", q)
-	}
-
-	byName := decode[resp](t, call(t, h, "GET", "/api/v1/queries?q=BAIDU", "", nil))
-	if len(byName.Queries) != 2 {
-		t.Errorf("q=BAIDU -> %+v", byName.Queries)
-	}
-	byRule := decode[resp](t, call(t, h, "GET", "/api/v1/queries?rule=local-zone&limit=1", "", nil))
-	if len(byRule.Queries) != 1 || byRule.Queries[0].Name != "home.local.example" {
-		t.Errorf("rule=local-zone -> %+v", byRule.Queries)
-	}
-	for _, bad := range []string{"0", "-1", "x", "513"} {
-		if rec := call(t, h, "GET", "/api/v1/queries?limit="+bad, "", nil); rec.Code != http.StatusBadRequest {
-			t.Errorf("limit=%s: %d", bad, rec.Code)
+	walk := func(query string) []string {
+		var names []string
+		cursor := ""
+		for range 100 {
+			page := decode[QueryPage](t, call(t, h, "GET", "/api/v1/queries?limit=4&"+query+"&cursor="+url.QueryEscape(cursor), "", nil))
+			for _, r := range page.Queries {
+				names = append(names, r.Name)
+			}
+			if page.Next == "" {
+				return names
+			}
+			cursor = page.Next
 		}
+		t.Fatal("paging does not end")
+		return nil
+	}
+	all := walk("")
+	if len(all) != 2*n || all[0] != "p24.example.org" || all[len(all)-1] != "p00.baidu.com" {
+		t.Fatalf("all pages: %d records, %v … %v", len(all), all[:1], all[len(all)-1:])
+	}
+	cn := walk("rule=cn")
+	if len(cn) != n || cn[0] != "p24.baidu.com" || cn[n-1] != "p00.baidu.com" {
+		t.Fatalf("rule=cn pages: %v", cn)
+	}
+}
+
+// TestAPIStateQueryLog verifies the query_log section of the state response.
+func TestAPIStateQueryLog(t *testing.T) {
+	e := start(t)
+	h := e.app.AdminHandler()
+	e.ask(t, "udp", "www.baidu.com.", dnsmessage.TypeA)
+	st := decode[State](t, call(t, h, "GET", "/api/v1/state", "", nil)).Status.QueryLog
+	if !st.Enabled || !st.Active || st.Dir != filepath.Join(e.dir, "logs") || st.Files != 1 || st.SizeBytes == 0 ||
+		st.MaxSizeBytes != 4096<<20 || st.MaxAgeSeconds != (30*24*time.Hour).Seconds() || st.Oldest == nil {
+		t.Errorf("query_log = %+v", st)
 	}
 }
 
@@ -180,6 +246,60 @@ func TestRecentRingWraps(t *testing.T) {
 	}
 	if list[0].Seq != recentCapacity+10 || list[len(list)-1].Seq != 11 {
 		t.Errorf("seq range %d..%d", list[0].Seq, list[len(list)-1].Seq)
+	}
+}
+
+// TestRecentPages verifies that paging the ring with the Seq of the last
+// record visits every matching entry once, newest first, and that the last
+// page reports no more.
+func TestRecentPages(t *testing.T) {
+	var r recent
+	for i := range 25 {
+		rule := "a"
+		if i%2 == 1 {
+			rule = "b"
+		}
+		r.add(recentEntry{name: "n", rule: rule})
+	}
+	var seen []uint64
+	before := uint64(0)
+	for pages := 0; ; pages++ {
+		if pages > 10 {
+			t.Fatal("paging did not end")
+		}
+		list, more, _ := r.page(before, 4, "", "a")
+		for _, rec := range list {
+			seen = append(seen, rec.Seq)
+		}
+		if !more {
+			break
+		}
+		before = list[len(list)-1].Seq
+	}
+	// Entries 1, 3, …, 25 carry rule "a": 13 of them, newest first.
+	if len(seen) != 13 || seen[0] != 25 || seen[12] != 1 {
+		t.Errorf("seen %v", seen)
+	}
+	for i := 1; i < len(seen); i++ {
+		if seen[i] >= seen[i-1] {
+			t.Fatalf("not strictly descending: %v", seen)
+		}
+	}
+	// A full last page must not claim more.
+	if _, more, _ := r.page(0, 13, "", "a"); more {
+		t.Error("exact page reported more")
+	}
+}
+
+// TestMemoryCursor verifies the cursor syntax of the in-memory source.
+func TestMemoryCursor(t *testing.T) {
+	if seq, err := parseMemoryCursor("m42"); err != nil || seq != 42 {
+		t.Errorf("m42: %d, %v", seq, err)
+	}
+	for _, bad := range []string{"42", "m", "m0", "m-1", "seg@0", "mx"} {
+		if _, err := parseMemoryCursor(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
 	}
 }
 
@@ -388,5 +508,65 @@ func TestAdminHostGuard(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Errorf("Host %q: %d, want 200", host, rec.Code)
 		}
+	}
+}
+
+// TestAPIObservability verifies the wiring of the observability endpoint: it is
+// disabled without a Prometheus URL, rejects an out-of-range window, and picks
+// up the configured Prometheus after a reload.
+func TestAPIObservability(t *testing.T) {
+	e := start(t)
+	h := e.app.AdminHandler()
+
+	rec := call(t, h, "GET", "/api/v1/observability", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("observability: %d %s", rec.Code, rec.Body)
+	}
+	snap := decode[observability.Snapshot](t, rec)
+	if snap.Prometheus.Configured || snap.Prometheus.Reachable || len(snap.Panels) != 0 {
+		t.Fatalf("disabled snapshot = %+v", snap)
+	}
+	if snap.WindowSeconds != (6 * time.Hour).Seconds() {
+		t.Errorf("default window = %v", snap.WindowSeconds)
+	}
+
+	if rec := call(t, h, "GET", "/api/v1/observability?range=1m", "", nil); rec.Code != http.StatusBadRequest {
+		t.Errorf("short range: %d %s", rec.Code, rec.Body)
+	}
+
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		kind := "vector"
+		if strings.HasSuffix(r.URL.Path, "query_range") {
+			kind = "matrix"
+		}
+		fmt.Fprintf(w, `{"status":"success","data":{"resultType":%q,"result":[]}}`, kind)
+	}))
+	defer fake.Close()
+
+	cfg, err := os.ReadFile(e.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg = append(cfg, []byte("\nobservability:\n  prometheus_url: "+fake.URL+"\n  job: splitter\n")...)
+	if err := os.WriteFile(e.cfg, cfg, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.app.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	rec = call(t, h, "GET", "/api/v1/observability?range=1h", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("observability after reload: %d %s", rec.Code, rec.Body)
+	}
+	snap = decode[observability.Snapshot](t, rec)
+	if !snap.Prometheus.Configured || !snap.Prometheus.Reachable || snap.Prometheus.Error != "" {
+		t.Fatalf("prometheus = %+v", snap.Prometheus)
+	}
+	if snap.WindowSeconds != time.Hour.Seconds() || snap.Prometheus.Job != "splitter" {
+		t.Errorf("snapshot = %+v", snap)
+	}
+	if len(snap.Panels) != 20 {
+		t.Errorf("panels = %d", len(snap.Panels))
 	}
 }

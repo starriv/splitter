@@ -31,6 +31,8 @@ import (
 	"github.com/starriv/splitter/internal/domain"
 	"github.com/starriv/splitter/internal/geosite"
 	"github.com/starriv/splitter/internal/metrics"
+	"github.com/starriv/splitter/internal/observability"
+	"github.com/starriv/splitter/internal/querylog"
 	"github.com/starriv/splitter/internal/router"
 	"github.com/starriv/splitter/internal/upstream"
 	"github.com/starriv/splitter/internal/webui"
@@ -238,10 +240,19 @@ type App struct {
 	m        *metrics.Metrics
 	rt       atomic.Pointer[Runtime]
 	queryLog atomic.Bool
+	// obs reads the observability page's data from Prometheus. It is nil when
+	// observability.prometheus_url is unset and is replaced on every reload.
+	obs      atomic.Pointer[observability.Client]
 	reloadMu sync.Mutex
 	status   atomic.Pointer[reloadStatus]
 	started  time.Time
-	recent   recent // latest routed queries, for the control page
+	recent   recent // latest answered queries, for the control page
+
+	// The query log is opened once at startup from the first configuration;
+	// qlogSettings records what it was opened with so that a reload can report
+	// a change that needs a restart. qlog is nil only when the log is disabled.
+	qlog         *querylog.Log[recentEntry]
+	qlogSettings config.QueryLogSettings
 
 	boundMu     sync.Mutex
 	boundListen []netip.AddrPort
@@ -249,14 +260,46 @@ type App struct {
 	boundKnown  bool
 }
 
-// New loads the configuration at path and returns an App. level is adjusted on
-// every load and reload.
+// New loads the configuration at path, opens the query log, and returns an
+// App. level is adjusted on every load and reload. Call Close when done.
 func New(path string, log *slog.Logger, level *slog.LevelVar, m *metrics.Metrics) (*App, error) {
 	a := &App{path: path, log: log, level: level, m: m, started: time.Now()}
 	if err := a.Reload(); err != nil {
 		return nil, err
 	}
+	if err := a.openQueryLog(a.rt.Load().Config); err != nil {
+		return nil, err
+	}
 	return a, nil
+}
+
+// openQueryLog opens the on-disk query log. When the log is enabled, a log
+// directory that cannot be created or written stops startup: silently running
+// without the history the operator expects is worse than not starting.
+func (a *App) openQueryLog(cfg *config.Config) error {
+	s := cfg.QueryLogSettings()
+	a.qlogSettings = s
+	if !s.Enabled {
+		return nil
+	}
+	l, err := querylog.Open(s.Dir, (*recentEntry).record, querylog.Options{
+		MaxBytes: s.MaxBytes, MaxAge: s.MaxAge, Observer: a.m,
+	})
+	if err != nil {
+		return fmt.Errorf("log.dir %s is not writable (set log.dir to a writable directory, or log.query_log.enabled: false): %w", s.Dir, err)
+	}
+	a.qlog = l
+	a.log.Info("query log", "dir", s.Dir, "max_bytes", s.MaxBytes, "max_age", s.MaxAge)
+	return nil
+}
+
+// Close flushes and closes the query log. Call it after the DNS server has
+// stopped, so that the last answered queries are written.
+func (a *App) Close() error {
+	if a.qlog == nil {
+		return nil
+	}
+	return a.qlog.Close()
 }
 
 // Runtime returns the currently active runtime.
@@ -314,10 +357,20 @@ func (a *App) Reload() error {
 			a.log.Warn("limits changes need a restart; the running semaphore and idle timeout stay as they were",
 				"running", old.Config.Limits, "config", cfg.Limits)
 		}
+		if s := cfg.QueryLogSettings(); s != a.qlogSettings {
+			a.log.Warn("log.dir and log.query_log changes need a restart; the query log keeps its startup settings",
+				"running", a.qlogSettings, "config", s)
+		}
 	}
 	a.level.Set(parseLevel(cfg.Log.Level))
 	a.queryLog.Store(cfg.Log.Queries)
 	a.rt.Store(rt)
+	a.obs.Store(observability.New(observability.Settings{
+		URL:          cfg.Observability.PrometheusURL,
+		Job:          cfg.Observability.Job,
+		DashboardURL: cfg.Observability.DashboardURL,
+		Timeout:      time.Duration(cfg.Observability.Timeout),
+	}))
 	a.status.Store(&reloadStatus{OK: true, At: time.Now()})
 	for name, u := range cfg.Upstreams {
 		labels := make([]string, 0, len(u.ServerAddrs()))
@@ -398,8 +451,12 @@ func (a *App) ServeDNS(ctx context.Context, req []byte, proto wire.Proto) []byte
 	rc := wire.EffectiveRCode(resp)
 	dur := time.Since(start)
 	a.m.ObserveQuery(rule.Name, rule.Action.String(), rule.Target(), wire.RCodeLabel(rc), dur)
-	a.recent.add(recentEntry{at: start, name: q.Name, qtype: q.Question.Type, proto: proto, rule: rule.Name,
-		set: d.Set, kind: d.Kind, target: rule.Target(), rcode: rc, tc: wire.Truncated(resp), dur: dur})
+	e := recentEntry{at: start, name: q.Name, qtype: q.Question.Type, class: q.Question.Class, proto: proto, rule: rule.Name,
+		set: d.Set, kind: d.Kind, target: rule.Target(), rcode: rc, tc: wire.Truncated(resp), dur: dur}
+	a.recent.add(e)
+	if a.qlog != nil {
+		a.qlog.Append(e)
+	}
 	if a.queryLog.Load() {
 		a.log.Info("query", "name", q.Name, "type", config.QTypeName(q.Question.Type), "proto", proto.String(),
 			"rule", rule.Name, "set", d.Set, "match", d.Kind.String(), "target", rule.Target(),
@@ -416,8 +473,30 @@ func (a *App) local(q wire.Query, rule string, rc dnsmessage.RCode, ans []dnsmes
 	// The target label records where a query is sent; locally answered queries
 	// never leave the process. The RCODE is recorded in the rcode label, so the
 	// target label keeps a single meaning for every rule.
-	a.m.ObserveQuery(rule, "reject", "local", wire.RCodeLabel(int(rc)), time.Since(start))
+	dur := time.Since(start)
+	a.m.ObserveQuery(rule, "reject", "local", wire.RCodeLabel(int(rc)), dur)
+	if isHealthcheckProbe(q) {
+		return resp
+	}
+	e := recentEntry{at: start, name: q.Name, proto: q.Proto, rule: rule, target: "local", rcode: int(rc), dur: dur}
+	if q.HasQuestion {
+		e.qtype, e.class = q.Question.Type, q.Question.Class
+	}
+	a.recent.add(e)
+	if a.qlog != nil {
+		a.qlog.Append(e)
+	}
 	return resp
+}
+
+// HealthcheckName is the name of the query that splitter -healthcheck sends
+// in class CH. It is answered locally with REFUSED like any other non-IN
+// query, but it is left out of the query history: Docker sends one every 30
+// seconds, and the history is for client queries.
+const HealthcheckName = "healthcheck.splitter.invalid"
+
+func isHealthcheckProbe(q wire.Query) bool {
+	return q.HasQuestion && q.Question.Class == dnsmessage.ClassCHAOS && q.Name == HealthcheckName
 }
 
 func localRecords(q wire.Query, ans router.LocalAnswer) []dnsmessage.Resource {
@@ -509,14 +588,14 @@ func (a *App) health() map[string]any {
 // that adds admin_hosts takes effect at once.
 func (a *App) AdminHandler() http.Handler {
 	mux := a.adminMux()
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return gzipHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !a.rt.Load().Config.AdminHostAllowed(r.Host) {
 			writeError(w, http.StatusMisdirectedRequest,
 				fmt.Sprintf("host %q is not an admin address; add it to admin_hosts if a reverse proxy publishes the admin endpoint", r.Host))
 			return
 		}
 		mux.ServeHTTP(w, r)
-	})
+	}))
 }
 
 func (a *App) adminMux() *http.ServeMux {

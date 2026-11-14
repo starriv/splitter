@@ -20,6 +20,9 @@ ARG COMMIT=none
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
       -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
       -o /out/splitter ./cmd/splitter
+# The runtime image has no shell to create directories, so the log directory is
+# made here and copied with the runtime user's ownership.
+RUN mkdir -p /out/log
 
 FROM gcr.io/distroless/static-debian12:nonroot
 ARG VERSION=dev
@@ -32,6 +35,9 @@ LABEL org.opencontainers.image.title="splitter" \
       org.opencontainers.image.version="${VERSION}"
 COPY --from=build /out/splitter /usr/local/bin/splitter
 COPY --from=build /src/LICENSE /usr/share/licenses/splitter/LICENSE
+# Default log.dir: the query log is written here. Mount a volume to keep it
+# across container re-creation.
+COPY --from=build --chown=65532:65532 /out/log /var/log/splitter
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/splitter"]
 CMD ["-config", "/etc/splitter/config.yaml"]

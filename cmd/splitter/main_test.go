@@ -38,6 +38,7 @@ func writeFiles(t *testing.T, dir string, dns, admin int, list string) string {
 	cfg := fmt.Sprintf(`
 listen: ["127.0.0.1:%d"]
 admin: "127.0.0.1:%d"
+log: {dir: logs}
 upstreams:
   u: {servers: ["192.0.2.1"], timeout: 100ms}
 sets:

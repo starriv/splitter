@@ -178,6 +178,7 @@ func FuzzServeDNS(f *testing.F) {
 	cfg := `
 listen: ["127.0.0.1:0"]
 admin: "127.0.0.1:0"
+log: {query_log: {enabled: false}}
 sets:
   local: {rules: ["domain:local.example", "keyword:ads", "regexp:^x[0-9]+\\."]}
 rules:

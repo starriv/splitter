@@ -25,6 +25,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/net/dns/dnsmessage"
+
 	"github.com/starriv/splitter/internal/app"
 	"github.com/starriv/splitter/internal/config"
 	"github.com/starriv/splitter/internal/metrics"
@@ -73,6 +75,13 @@ func run() int {
 		log.Error("load config", "err", err)
 		return 1
 	}
+	// Runs after the DNS listeners have shut down (below), so the last answered
+	// queries reach the query log.
+	defer func() {
+		if err := a.Close(); err != nil {
+			log.Warn("close query log", "err", err)
+		}
+	}()
 	cfg := a.Runtime().Config
 
 	srv := server.New(a, server.Options{
@@ -218,16 +227,24 @@ func healthcheckAdmin(path, override string) (netip.AddrPort, error) {
 	return config.LoadAdminAddr(path)
 }
 
-// probeQuery is a "version.bind CH TXT" query with the ID left at zero. A
-// CHAOS-class query is answered locally with REFUSED under every configuration,
-// so the probe never reaches an upstream and does not depend on which rules
-// exist. It is counted in splitter_queries_total{rule="_invalid"} twice a
-// minute.
-var probeQuery = []byte{
-	0, 0, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
-	7, 'v', 'e', 'r', 's', 'i', 'o', 'n', 4, 'b', 'i', 'n', 'd', 0,
-	0, 16, 0, 3,
-}
+// probeQuery is a CH TXT query for app.HealthcheckName with the ID left at
+// zero. A CHAOS-class query is answered locally with REFUSED under every
+// configuration, so the probe never reaches an upstream and does not depend on
+// which rules exist. It is counted in splitter_queries_total{rule="_invalid"}
+// twice a minute but kept out of the query log.
+var probeQuery = func() []byte {
+	m := dnsmessage.Message{
+		Header: dnsmessage.Header{RecursionDesired: true},
+		Questions: []dnsmessage.Question{{
+			Name: dnsmessage.MustNewName(app.HealthcheckName + "."), Type: dnsmessage.TypeTXT, Class: dnsmessage.ClassCHAOS,
+		}},
+	}
+	b, err := m.Pack()
+	if err != nil {
+		panic(err)
+	}
+	return b
+}()
 
 // probeDNS sends probeQuery over UDP and accepts any response carrying its ID.
 func probeDNS(ap netip.AddrPort, timeout time.Duration) error {
@@ -277,6 +294,11 @@ func runCheck(path string) int {
 	}
 	for _, r := range rt.Router.Rules() {
 		fmt.Printf("  rule %-12s %-8s -> %s\n", r.Name, r.Action, r.Target())
+	}
+	if s := cfg.QueryLogSettings(); s.Enabled {
+		fmt.Printf("  query log %s (up to %d MiB, kept %s)\n", s.Dir, s.MaxBytes>>20, s.MaxAge)
+	} else {
+		fmt.Println("  query log off")
 	}
 	return 0
 }

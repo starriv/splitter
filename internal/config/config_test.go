@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // valid is a minimal configuration that passes validation. Each rejection case
@@ -234,5 +235,95 @@ func TestLoadAdminAddr(t *testing.T) {
 	}
 	if _, err := LoadAdminAddr(p); err == nil {
 		t.Error("non-loopback admin address accepted")
+	}
+}
+
+// TestLogDefaults verifies the log directory and query log defaults and that
+// relative directories resolve against the configuration directory.
+func TestLogDefaults(t *testing.T) {
+	c, err := Parse([]byte(valid), "/etc/splitter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := c.QueryLogSettings()
+	want := QueryLogSettings{Enabled: true, Dir: DefaultLogDir, MaxBytes: DefaultQueryLogMaxSizeMB << 20, MaxAge: DefaultQueryLogMaxAge}
+	if got != want {
+		t.Fatalf("defaults: %+v", got)
+	}
+
+	c, err = Parse([]byte(valid+"log:\n  dir: logs\n  query_log: {enabled: false, max_size_mb: 8, max_age: 24h}\n"), "/etc/splitter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = c.QueryLogSettings()
+	want = QueryLogSettings{Enabled: false, Dir: "/etc/splitter/logs", MaxBytes: 8 << 20, MaxAge: 24 * time.Hour}
+	if got != want {
+		t.Fatalf("explicit: %+v", got)
+	}
+}
+
+// TestLogRejects verifies that out-of-range query log settings are reported.
+func TestLogRejects(t *testing.T) {
+	for _, tc := range []struct{ frag, want string }{
+		{"log: {query_log: {max_size_mb: -1}}", "max_size_mb"},
+		{"log: {query_log: {max_size_mb: 100000}}", "max_size_mb"},
+		{"log: {query_log: {max_age: 1m}}", "max_age"},
+		{"log: {query_log: {max_age: 9000h}}", "max_age"},
+		{`log: {dir: " /tmp"}`, "log.dir"},
+	} {
+		_, err := Parse([]byte(valid+tc.frag+"\n"), "/etc/splitter")
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: got %v, want %q", tc.frag, err, tc.want)
+		}
+	}
+}
+
+// TestObservability verifies the optional observability block: URL validation,
+// defaults, and the requirement that a Grafana link only exists when the page
+// can be enabled.
+func TestObservability(t *testing.T) {
+	parse := func(block string) (*Config, error) {
+		return Parse([]byte(valid+"\nobservability:\n"+block), "/etc/splitter")
+	}
+
+	c, err := parse("  prometheus_url: http://127.0.0.1:9090/prom\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Observability.PrometheusURL != "http://127.0.0.1:9090/prom" {
+		t.Errorf("url = %q", c.Observability.PrometheusURL)
+	}
+	if c.Observability.Job != DefaultObservabilityJob {
+		t.Errorf("default job = %q", c.Observability.Job)
+	}
+	if got := time.Duration(c.Observability.Timeout); got != DefaultObservabilityTimeout {
+		t.Errorf("default timeout = %s", got)
+	}
+
+	c, err = parse("  prometheus_url: https://prometheus.example\n  job: splitter-prod\n  dashboard_url: https://grafana.example/d/x?from=now-6h\n  timeout: 2s\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Observability.Job != "splitter-prod" || time.Duration(c.Observability.Timeout) != 2*time.Second {
+		t.Errorf("observability = %+v", c.Observability)
+	}
+	if c.Observability.DashboardURL != "https://grafana.example/d/x?from=now-6h" {
+		t.Errorf("dashboard url = %q", c.Observability.DashboardURL)
+	}
+
+	for _, tc := range []struct{ block, want string }{
+		{"  prometheus_url: ftp://prometheus\n", "scheme must be http or https"},
+		{"  prometheus_url: http://user:pass@prometheus\n", "credentials must not be embedded"},
+		{"  prometheus_url: http://prometheus/x?y=1\n", "must not carry a query"},
+		{"  prometheus_url: prometheus\n", "scheme must be http or https"},
+		{"  dashboard_url: https://grafana.example/d/x\n", "requires observability.prometheus_url"},
+		{"  prometheus_url: http://prometheus\n  job: \"two words\"\n", "observability.job"},
+		{"  prometheus_url: http://prometheus\n  timeout: 500ms\n", "observability.timeout"},
+		{"  prometheus_url: http://prometheus\n  timeout: 2h\n", "observability.timeout"},
+		{"  prometheus_url: http://prometheus\n  unknown: x\n", "field unknown not found"},
+	} {
+		if _, err := parse(tc.block); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("block %q: error = %v, want %q", tc.block, err, tc.want)
+		}
 	}
 }

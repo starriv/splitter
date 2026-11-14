@@ -49,6 +49,9 @@ type Metrics struct {
 	writeErrors *prometheus.CounterVec
 	malformed   prometheus.Counter
 	panics      prometheus.Counter
+	qlWritten   prometheus.Counter
+	qlDropped   prometheus.Counter
+	qlErrors    prometheus.Counter
 }
 
 // upstreamErrorReasons lists every reason that upstream_errors_total can carry
@@ -140,10 +143,19 @@ func New(version, commit string) *Metrics {
 	m.panics = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: ns, Name: "panics_total", Help: "Query handlers that panicked; the query was dropped and the process kept serving. Any value above 0 is a bug.",
 	})
+	m.qlWritten = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: ns, Name: "query_log_records_total", Help: "Answered queries written to the on-disk query log.",
+	})
+	m.qlDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: ns, Name: "query_log_dropped_total", Help: "Answered queries not written to the query log because its queue was full (the disk is slower than the query rate).",
+	})
+	m.qlErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: ns, Name: "query_log_write_errors_total", Help: "Query log write failures plus records lost while writing is suspended after a failure (disk full, permissions); those records are not on disk.",
+	})
 	for _, c := range []prometheus.Collector{
 		m.queries, m.responses, m.duration, m.upRequests, m.upErrors, m.upDuration, m.upDropped, m.upRetrans,
 		m.upPenalized, m.snapshot, m.reloads, m.lastReload, m.reloadOK, m.inflight, m.tcpConns, m.overload, m.writeErrors,
-		m.malformed, m.panics,
+		m.malformed, m.panics, m.qlWritten, m.qlDropped, m.qlErrors,
 	} {
 		f(c)
 	}
@@ -226,6 +238,15 @@ func (m *Metrics) ObserveQuery(rule, action, target, rcode string, d time.Durati
 	m.responses.WithLabelValues(rcode).Inc()
 	m.duration.WithLabelValues(rule).Observe(d.Seconds())
 }
+
+// QueryLogWritten implements querylog.Observer.
+func (m *Metrics) QueryLogWritten() { m.qlWritten.Inc() }
+
+// QueryLogDropped implements querylog.Observer.
+func (m *Metrics) QueryLogDropped() { m.qlDropped.Inc() }
+
+// QueryLogWriteError implements querylog.Observer.
+func (m *Metrics) QueryLogWriteError() { m.qlErrors.Inc() }
 
 // Malformed counts one query that could not be parsed.
 func (m *Metrics) Malformed() { m.malformed.Inc() }

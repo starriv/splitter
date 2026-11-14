@@ -18,6 +18,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -59,14 +60,15 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 // always accepted; any other Host header is refused, which stops
 // DNS-rebinding pages from reading the admin API.
 type Config struct {
-	Listen     []string            `yaml:"listen"`      // client addresses to serve DNS on
-	Admin      string              `yaml:"admin"`       // address for metrics and health endpoints
-	AdminHosts []string            `yaml:"admin_hosts"` // extra Host names accepted by the admin endpoints
-	Log        Log                 `yaml:"log"`         // logging configuration
-	Limits     Limits              `yaml:"limits"`      // concurrency and reload limits
-	Upstreams  map[string]Upstream `yaml:"upstreams"`   // named upstream groups
-	Sets       map[string]Set      `yaml:"sets"`        // named domain matchers
-	Rules      []Rule              `yaml:"rules"`       // rules evaluated in order
+	Listen        []string            `yaml:"listen"`        // client addresses to serve DNS on
+	Admin         string              `yaml:"admin"`         // address for metrics and health endpoints
+	AdminHosts    []string            `yaml:"admin_hosts"`   // extra Host names accepted by the admin endpoints
+	Log           Log                 `yaml:"log"`           // logging configuration
+	Limits        Limits              `yaml:"limits"`        // concurrency and reload limits
+	Observability Observability       `yaml:"observability"` // the optional Prometheus-backed console page
+	Upstreams     map[string]Upstream `yaml:"upstreams"`     // named upstream groups
+	Sets          map[string]Set      `yaml:"sets"`          // named domain matchers
+	Rules         []Rule              `yaml:"rules"`         // rules evaluated in order
 
 	dir        string
 	listen     []netip.AddrPort
@@ -75,9 +77,23 @@ type Config struct {
 }
 
 // Log configures logging.
+//
+// Dir is the directory the splitter writes its own files to; the query log
+// lives there. It defaults to DefaultLogDir. When the query log is enabled and
+// Dir cannot be written, startup fails.
 type Log struct {
-	Level   string `yaml:"level"`   // debug, info, warn, error
-	Queries bool   `yaml:"queries"` // one line per query at info level
+	Level    string   `yaml:"level"`     // debug, info, warn, error
+	Queries  bool     `yaml:"queries"`   // one line per query at info level on stderr
+	Dir      string   `yaml:"dir"`       // directory for log files
+	QueryLog QueryLog `yaml:"query_log"` // every answered query persisted under Dir
+}
+
+// QueryLog configures the on-disk query log read by the control page. Enabled
+// is a pointer so that an omitted value can default to true.
+type QueryLog struct {
+	Enabled   *bool    `yaml:"enabled"`     // default true
+	MaxSizeMB int      `yaml:"max_size_mb"` // total size of all query log files
+	MaxAge    Duration `yaml:"max_age"`     // files older than this are removed
 }
 
 // Limits bounds the server's concurrency and the size change that a reload may
@@ -90,6 +106,27 @@ type Limits struct {
 	// reload, in (0, 1]; 1 turns the guard off. Applied on reload, never at
 	// startup (there is nothing to compare against).
 	MaxSetShrink float64 `yaml:"max_set_shrink"`
+}
+
+// Observability configures the control console's observability page, which
+// reads the splitter's own series back from a Prometheus server. Prometheus is
+// the only component that stores history, so the page asks it for the range
+// charts instead of keeping a second time-series store in the resolver.
+//
+// The block is optional. With PrometheusURL empty the page explains how to
+// enable it and makes no network requests.
+type Observability struct {
+	// PrometheusURL is the base URL of the Prometheus server, for example
+	// "http://127.0.0.1:9090" or "https://prometheus.example/prom".
+	PrometheusURL string `yaml:"prometheus_url"`
+	// Job is the scrape job name under which Prometheus scrapes this splitter,
+	// used by the scrape-health panel. Defaults to "splitter".
+	Job string `yaml:"job"`
+	// DashboardURL is an optional link to the Grafana dashboard the page
+	// reproduces, shown as "在 Grafana 中打开".
+	DashboardURL string `yaml:"dashboard_url"`
+	// Timeout bounds one Prometheus API request.
+	Timeout Duration `yaml:"timeout"`
 }
 
 // Upstream is a named group of DNS servers. Servers are tried in order, and
@@ -154,6 +191,19 @@ const (
 	// DefaultAnswerTTL is the default TTL, in seconds, of locally answered
 	// records.
 	DefaultAnswerTTL = 60
+	// DefaultLogDir is the default log directory. The container image creates
+	// it, owned by the runtime user.
+	DefaultLogDir = "/var/log/splitter"
+	// DefaultQueryLogMaxSizeMB is the default size cap of the query log.
+	DefaultQueryLogMaxSizeMB = 4096
+	// DefaultQueryLogMaxAge is the default retention of the query log.
+	DefaultQueryLogMaxAge = 30 * 24 * time.Hour
+	// DefaultObservabilityJob is the default Prometheus scrape job name of the
+	// splitter.
+	DefaultObservabilityJob = "splitter"
+	// DefaultObservabilityTimeout is the default deadline for one Prometheus
+	// API request made by the control page.
+	DefaultObservabilityTimeout = 8 * time.Second
 
 	// Each in-flight query may hold one 4 KiB upstream receive buffer, so this
 	// bounds that memory at 64 MiB.
@@ -164,7 +214,20 @@ const (
 	minIdleTimeout   = time.Second
 	maxIdleTimeout   = 5 * time.Minute
 	maxAnswerTTL     = 7 * 24 * 60 * 60
+	maxQueryLogMB    = 65536
+	minQueryLogAge   = time.Hour
+	maxQueryLogAge   = 366 * 24 * time.Hour
+	minObservability = time.Second
+	maxObservability = 60 * time.Second
+	// The job label is embedded in a PromQL matcher. Restricting it to
+	// unquoted, printable characters keeps the query construction independent
+	// of PromQL escaping rules.
+	maxObservabilityJobLength = 128
 )
+
+// observabilityJobRE constrains observability.job: a Prometheus job name is
+// written into the up{job="..."} matcher, so it stays unquoted and printable.
+var observabilityJobRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]*$`)
 
 // qtypeCodes maps the query type mnemonics accepted by ParseQType to their type
 // codes. Types without a dnsmessage constant are written as numbers.
@@ -261,6 +324,19 @@ func (c *Config) defaults() {
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
 	}
+	if c.Log.Dir == "" {
+		c.Log.Dir = DefaultLogDir
+	}
+	if c.Log.QueryLog.Enabled == nil {
+		on := true
+		c.Log.QueryLog.Enabled = &on
+	}
+	if c.Log.QueryLog.MaxSizeMB == 0 {
+		c.Log.QueryLog.MaxSizeMB = DefaultQueryLogMaxSizeMB
+	}
+	if c.Log.QueryLog.MaxAge == 0 {
+		c.Log.QueryLog.MaxAge = Duration(DefaultQueryLogMaxAge)
+	}
 	if c.Limits.MaxInflight == 0 {
 		c.Limits.MaxInflight = DefaultMaxInflight
 	}
@@ -272,6 +348,14 @@ func (c *Config) defaults() {
 	}
 	if c.Limits.MaxSetShrink == 0 {
 		c.Limits.MaxSetShrink = DefaultMaxSetShrink
+	}
+	c.Observability.PrometheusURL = strings.TrimSpace(c.Observability.PrometheusURL)
+	c.Observability.DashboardURL = strings.TrimSpace(c.Observability.DashboardURL)
+	if c.Observability.Job == "" {
+		c.Observability.Job = DefaultObservabilityJob
+	}
+	if c.Observability.Timeout == 0 {
+		c.Observability.Timeout = Duration(DefaultObservabilityTimeout)
 	}
 	for k, u := range c.Upstreams {
 		if u.Timeout == 0 {
@@ -375,6 +459,15 @@ func (c *Config) validate() error {
 	default:
 		fail("log.level: %q is not one of debug, info, warn, error", c.Log.Level)
 	}
+	if strings.TrimSpace(c.Log.Dir) != c.Log.Dir {
+		fail("log.dir: %q has leading or trailing spaces", c.Log.Dir)
+	}
+	if n := c.Log.QueryLog.MaxSizeMB; n < 1 || n > maxQueryLogMB {
+		fail("log.query_log.max_size_mb: %d outside [1, %d]", n, maxQueryLogMB)
+	}
+	if d := time.Duration(c.Log.QueryLog.MaxAge); d < minQueryLogAge || d > maxQueryLogAge {
+		fail("log.query_log.max_age: %s outside [%s, %s]", d, minQueryLogAge, maxQueryLogAge)
+	}
 	if c.Limits.MaxInflight < 1 || c.Limits.MaxInflight > maxInflightLimit {
 		fail("limits.max_inflight: must be in [1, %d]", maxInflightLimit)
 	}
@@ -387,6 +480,27 @@ func (c *Config) validate() error {
 
 	if s := c.Limits.MaxSetShrink; !(s > 0 && s <= 1) {
 		fail("limits.max_set_shrink: %v outside (0, 1] (1 disables the guard)", s)
+	}
+
+	if u := c.Observability.PrometheusURL; u != "" {
+		if err := checkHTTPURL(u, false); err != nil {
+			fail("observability.prometheus_url: %v", err)
+		}
+	} else if c.Observability.DashboardURL != "" {
+		// The Grafana link is only meaningful when the page is enabled; an
+		// orphan link is a configuration mistake, not a reason to refuse.
+		fail("observability.dashboard_url: requires observability.prometheus_url (the page is disabled without it)")
+	}
+	if u := c.Observability.DashboardURL; u != "" {
+		if err := checkHTTPURL(u, true); err != nil {
+			fail("observability.dashboard_url: %v", err)
+		}
+	}
+	if job := c.Observability.Job; !observabilityJobRE.MatchString(job) || len(job) > maxObservabilityJobLength {
+		fail("observability.job: %q must be 1-%d characters from [A-Za-z0-9_.:-], starting with a letter or digit", job, maxObservabilityJobLength)
+	}
+	if d := time.Duration(c.Observability.Timeout); d < minObservability || d > maxObservability {
+		fail("observability.timeout: %s outside [%s, %s]", d, minObservability, maxObservability)
 	}
 
 	// No upstream at all is valid for a configuration that only answers and
@@ -569,6 +683,29 @@ func (c *Config) validate() error {
 	return errors.Join(errs...)
 }
 
+// checkHTTPURL validates an HTTP(S) URL. Credentials are refused so that they
+// cannot end up in logs or the console page. A query is only allowed on a link
+// (the Grafana dashboard), never on the base URL the splitter calls.
+func checkHTTPURL(raw string, allowQuery bool) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%q is not a URL: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("%q: scheme must be http or https", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%q: a host is required", raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%q: credentials must not be embedded; publish the endpoint without auth or use a local address", raw)
+	}
+	if !allowQuery && (u.RawQuery != "" || u.Fragment != "") {
+		return fmt.Errorf("%q: must not carry a query or fragment", raw)
+	}
+	return nil
+}
+
 func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -600,6 +737,33 @@ func (c *Config) Path(p string) string {
 		return p
 	}
 	return filepath.Join(c.dir, p)
+}
+
+// LogDir returns the log directory, resolved against the configuration file's
+// directory when relative.
+func (c *Config) LogDir() string { return c.Path(c.Log.Dir) }
+
+// QueryLogEnabled reports whether answered queries are persisted under LogDir.
+func (c *Config) QueryLogEnabled() bool { return *c.Log.QueryLog.Enabled }
+
+// QueryLogSettings is the part of the configuration that fixes the query log
+// for the life of the process; comparing two values detects a change that
+// needs a restart.
+type QueryLogSettings struct {
+	Enabled  bool
+	Dir      string
+	MaxBytes int64
+	MaxAge   time.Duration
+}
+
+// QueryLogSettings returns the query log settings after defaults.
+func (c *Config) QueryLogSettings() QueryLogSettings {
+	return QueryLogSettings{
+		Enabled:  c.QueryLogEnabled(),
+		Dir:      c.LogDir(),
+		MaxBytes: int64(c.Log.QueryLog.MaxSizeMB) << 20,
+		MaxAge:   time.Duration(c.Log.QueryLog.MaxAge),
+	}
 }
 
 // ListenAddrs returns the validated listen addresses.

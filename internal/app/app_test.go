@@ -43,7 +43,7 @@ type env struct {
 // writeConfig writes the configuration shared by the app tests: the local zone
 // is answered locally, the cn set forwards to one upstream group, and every
 // other query forwards to another group.
-func writeConfig(t testing.TB, dir string, cn, ab netip.AddrPort, cnList string) string {
+func writeConfig(t testing.TB, dir string, cn, ab netip.AddrPort, cnList string, queryLogOff ...bool) string {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, "cn-domains.txt"), []byte(cnList), 0o644); err != nil {
 		t.Fatal(err)
@@ -51,6 +51,7 @@ func writeConfig(t testing.TB, dir string, cn, ab netip.AddrPort, cnList string)
 	cfg := fmt.Sprintf(`
 listen: ["127.0.0.1:0"]
 admin: "127.0.0.1:0"
+log: {dir: logs, query_log: {enabled: %t}}
 upstreams:
   aliyun: {servers: ["%s"], timeout: 1s}
   cloudflare: {servers: ["%s"], timeout: 1s}
@@ -61,7 +62,7 @@ rules:
   - {name: local-zone, sets: [local], answer: {a: ["192.0.2.10"], ttl: 60}}
   - {name: cn, sets: [cn], forward: aliyun}
   - {name: default, forward: cloudflare}
-`, cn, ab)
+`, len(queryLogOff) == 0 || !queryLogOff[0], cn, ab)
 	p := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(p, []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
@@ -72,12 +73,13 @@ rules:
 // start creates a test environment: two fake upstreams, a configuration with
 // the shared routing shape, and a running DNS server that is shut down during
 // test cleanup.
-func start(t *testing.T) *env {
+// start passes queryLogOff to writeConfig.
+func start(t *testing.T, queryLogOff ...bool) *env {
 	t.Helper()
 	e := &env{dir: t.TempDir()}
 	e.cn = dnstest.StartUpstream(t, cnAddr)
 	e.ab = dnstest.StartUpstream(t, abroadAddr)
-	e.cfg = writeConfig(t, e.dir, e.cn.Addr, e.ab.Addr, "# test\ndomain:baidu.com\nfull:www.qq.com\n")
+	e.cfg = writeConfig(t, e.dir, e.cn.Addr, e.ab.Addr, "# test\ndomain:baidu.com\nfull:www.qq.com\n", queryLogOff...)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	m := metrics.New("test", "test")
 	a, err := New(e.cfg, log, new(slog.LevelVar), m)
@@ -94,6 +96,7 @@ func start(t *testing.T) *env {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
+		_ = a.Close()
 	})
 	e.dns = srv.Addrs()[0]
 	return e
@@ -417,6 +420,7 @@ func BenchmarkServeDNS(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
+	b.Cleanup(func() { _ = a.Close() })
 	req := dnstest.NewQuery(b, 1, "x.local.example.", dnsmessage.TypeA, true)
 	b.ReportAllocs()
 	for b.Loop() {
