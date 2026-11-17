@@ -451,8 +451,10 @@ func (a *App) ServeDNS(ctx context.Context, req []byte, proto wire.Proto) []byte
 	rc := wire.EffectiveRCode(resp)
 	dur := time.Since(start)
 	a.m.ObserveQuery(rule.Name, rule.Action.String(), rule.Target(), wire.RCodeLabel(rc), dur)
+	answers, answersTruncated := recentAnswers(resp)
 	e := recentEntry{at: start, name: q.Name, qtype: q.Question.Type, class: q.Question.Class, proto: proto, rule: rule.Name,
-		set: d.Set, kind: d.Kind, target: rule.Target(), rcode: rc, tc: wire.Truncated(resp), dur: dur}
+		set: d.Set, kind: d.Kind, target: rule.Target(), rcode: rc, tc: wire.Truncated(resp),
+		answers: answers, answersTruncated: answersTruncated, dur: dur}
 	a.recent.add(e)
 	if a.qlog != nil {
 		a.qlog.Append(e)
@@ -478,7 +480,9 @@ func (a *App) local(q wire.Query, rule string, rc dnsmessage.RCode, ans []dnsmes
 	if isHealthcheckProbe(q) {
 		return resp
 	}
-	e := recentEntry{at: start, name: q.Name, proto: q.Proto, rule: rule, target: "local", rcode: int(rc), dur: dur}
+	answers, answersTruncated := recentAnswers(resp)
+	e := recentEntry{at: start, name: q.Name, proto: q.Proto, rule: rule, target: "local", rcode: int(rc),
+		answers: answers, answersTruncated: answersTruncated, dur: dur}
 	if q.HasQuestion {
 		e.qtype, e.class = q.Question.Type, q.Question.Class
 	}

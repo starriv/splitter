@@ -20,21 +20,26 @@ import (
 // traffic.
 const recentCapacity = 512
 
-// recentEntry stores raw values so that the hot path performs no formatting.
+// recentEntry stores raw values so that formatting stays off the API path.
+// The decoded answer section is the exception: both the in-memory ring and the
+// query log need it, and keeping the few display strings is cheaper than
+// retaining and re-decoding the raw reply twice.
 type recentEntry struct {
-	seq    uint64
-	at     time.Time
-	name   string
-	qtype  dnsmessage.Type
-	class  dnsmessage.Class // zero when the query had no readable question
-	proto  wire.Proto
-	rule   string
-	set    string
-	kind   domain.Kind
-	target string
-	rcode  int
-	tc     bool
-	dur    time.Duration
+	seq              uint64
+	at               time.Time
+	name             string
+	qtype            dnsmessage.Type
+	class            dnsmessage.Class // zero when the query had no readable question
+	proto            wire.Proto
+	rule             string
+	set              string
+	kind             domain.Kind
+	target           string
+	rcode            int
+	tc               bool
+	answers          []querylog.Answer
+	answersTruncated bool
+	dur              time.Duration
 }
 
 // QueryRecord is one entry of GET /api/v1/queries. The in-memory ring and the
@@ -42,12 +47,20 @@ type recentEntry struct {
 // source; Seq is set only by the ring.
 type QueryRecord = querylog.Record
 
-// record formats an entry for the API and the query log.
+// record formats an entry for the API and the query log. A record written by
+// this version always carries an answers array, empty when there was no
+// answer section, so clients can tell it apart from an older record that did
+// not store answers at all.
 func (e *recentEntry) record() QueryRecord {
+	answers := e.answers
+	if answers == nil {
+		answers = []querylog.Answer{}
+	}
 	rec := QueryRecord{
 		Seq: e.seq, Time: e.at.UTC(), Name: e.name,
 		Proto: e.proto.String(), Rule: e.rule, Set: e.set, Target: e.target,
 		RCode: wire.RCodeName(e.rcode), Truncated: e.tc,
+		Answers: answers, AnswersTruncated: e.answersTruncated,
 		DurationMS: float64(e.dur.Microseconds()) / 1000,
 	}
 	if e.class != 0 {

@@ -39,19 +39,34 @@ import (
 // Record is one answered query as stored on disk and returned by the API.
 // Queries refused locally before routing carry the rule "_invalid".
 type Record struct {
-	Seq        uint64    `json:"seq,omitempty"` // in-memory ring only; not stable across restarts
-	Time       time.Time `json:"time"`
-	Name       string    `json:"name"`
-	Type       string    `json:"type"`            // empty when the query carried no readable question
-	Class      string    `json:"class,omitempty"` // set only for classes other than IN
-	Proto      string    `json:"proto"`
-	Rule       string    `json:"rule"`
-	Set        string    `json:"set,omitempty"`
-	Match      string    `json:"match,omitempty"`
-	Target     string    `json:"target"`
-	RCode      string    `json:"rcode"`
-	Truncated  bool      `json:"truncated,omitempty"`
-	DurationMS float64   `json:"duration_ms"`
+	Seq       uint64    `json:"seq,omitempty"` // in-memory ring only; not stable across restarts
+	Time      time.Time `json:"time"`
+	Name      string    `json:"name"`
+	Type      string    `json:"type"`            // empty when the query carried no readable question
+	Class     string    `json:"class,omitempty"` // set only for classes other than IN
+	Proto     string    `json:"proto"`
+	Rule      string    `json:"rule"`
+	Set       string    `json:"set,omitempty"`
+	Match     string    `json:"match,omitempty"`
+	Target    string    `json:"target"`
+	RCode     string    `json:"rcode"`
+	Truncated bool      `json:"truncated,omitempty"`
+	// Answers holds the decoded answer section so the control page can show
+	// what the upstream returned instead of only the RCODE. The query log
+	// writes the key on every record, possibly as an empty array; a stored
+	// line without it was written by an older version that did not keep
+	// answers (the API reports null for such a record).
+	Answers          []Answer `json:"answers"`
+	AnswersTruncated bool     `json:"answers_truncated,omitempty"` // some records or data were left out to bound the entry
+	DurationMS       float64  `json:"duration_ms"`
+}
+
+// Answer is one decoded answer record stored with a query.
+type Answer struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	TTL  uint32 `json:"ttl"`
+	Data string `json:"data"`
 }
 
 // Observer receives write-side events, typically to update metrics. Methods

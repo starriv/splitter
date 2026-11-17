@@ -17,6 +17,7 @@ import (
 
 	"github.com/starriv/splitter/internal/dnstest"
 	"github.com/starriv/splitter/internal/observability"
+	"github.com/starriv/splitter/internal/querylog"
 )
 
 // call builds a request and serves it through h, returning the recorded
@@ -181,6 +182,61 @@ func TestAPIQueries(t *testing.T) {
 				t.Errorf("bad cursor: %d", rec.Code)
 			}
 		})
+	}
+}
+
+// TestAPIQueryAnswers verifies that a query record carries the decoded answer
+// section from both sources, and that a NOERROR reply without records reports
+// an empty (not missing) answers array.
+func TestAPIQueryAnswers(t *testing.T) {
+	for _, source := range []string{"disk", "memory"} {
+		t.Run(source, func(t *testing.T) {
+			e := start(t, source == "memory")
+			h := e.app.AdminHandler()
+			e.ask(t, "udp", "www.baidu.com.", dnsmessage.TypeA)
+			e.ask(t, "udp", "home.local.example.", dnsmessage.TypeAAAA) // NOERROR, no answers
+
+			page := decode[QueryPage](t, call(t, h, "GET", "/api/v1/queries", "", nil))
+			if len(page.Queries) != 2 {
+				t.Fatalf("queries = %+v", page.Queries)
+			}
+			if q := page.Queries[0]; q.RCode != "NOERROR" || q.Answers == nil || len(q.Answers) != 0 {
+				t.Errorf("NODATA record = %+v", q)
+			}
+			q := page.Queries[1]
+			if len(q.Answers) != 1 {
+				t.Fatalf("forwarded record answers = %+v", q.Answers)
+			}
+			if a := q.Answers[0]; a.Name != "www.baidu.com" || a.Type != "A" || a.TTL != 300 || a.Data != cnAddr.String() {
+				t.Errorf("forwarded answer = %+v", a)
+			}
+			if q.AnswersTruncated {
+				t.Error("a single answer must not be reported as truncated")
+			}
+		})
+	}
+}
+
+// TestQueryFilterDecidesOnDecodedRecord verifies that the cheap raw-byte
+// prefilter cannot select a record on its own: an answer value may contain text
+// that looks like a rule field.
+func TestQueryFilterDecidesOnDecodedRecord(t *testing.T) {
+	f := queryFilter("cn", "")
+	if f.Keep == nil {
+		t.Fatal("rule filter has no decoded check")
+	}
+	decoy := &querylog.Record{Rule: "default", Answers: []querylog.Answer{{Type: "TXT", Data: `"rule":"cn"`}}}
+	if f.Keep(decoy) {
+		t.Error("a decoy answer selected a record for another rule")
+	}
+	if !f.Keep(&querylog.Record{Rule: "cn"}) {
+		t.Error("the matching rule was rejected")
+	}
+
+	byName := queryFilter("", "baidu")
+	if byName.Keep == nil || !byName.Keep(&querylog.Record{Name: "www.baidu.com"}) ||
+		byName.Keep(&querylog.Record{Name: "www.google.com", Answers: []querylog.Answer{{Data: "baidu"}}}) {
+		t.Error("name filter does not decide on the decoded name")
 	}
 }
 

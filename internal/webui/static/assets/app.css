@@ -812,12 +812,30 @@ select.input {
 }
 #rules { min-width: 720px; }
 #overview-rules { min-width: 420px; }
+/* The order and count columns hold one or two digits. Without an explicit
+   width the auto layout hands them a proportional share of the spare width,
+   which reads as empty space; the rule name and the share bar can use it. */
+#overview-rules th:first-child,
+#overview-rules td:first-child,
+#overview-rules th:nth-child(3),
+#overview-rules td:nth-child(3) { width: 1%; }
 #overview-recent { min-width: 560px; }
 #upstreams .table { min-width: 520px; }
 #sets { min-width: 480px; }
 #recent { min-width: 720px; }
 #recent td { height: 40px; }
 .chips { display: flex; flex-wrap: wrap; flex-wrap: balance; align-items: center; gap: var(--space-1) var(--space-2); }
+
+/* One answer value in the recent-queries result cell. Long TXT data is cut
+   with an ellipsis; the full value is in the title attribute. */
+.chips .answer {
+  display: inline-block;
+  max-width: 18rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
 
 .share { display: flex; align-items: center; gap: var(--space-3); min-width: 140px; }
 .share-track { flex: 1; height: 6px; overflow: hidden; border-radius: var(--radius-pill); background: var(--surface-muted); }

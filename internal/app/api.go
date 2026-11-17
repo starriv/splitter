@@ -143,22 +143,36 @@ func (a *App) queries(cursor string, limit int, substr, rule string) (QueryPage,
 		}
 		return page, nil
 	}
-	var f querylog.Filter
-	if rule != "" {
-		f.Contains = append(f.Contains, []byte(`"rule":`+strconv.Quote(rule)))
-	}
-	if substr != "" {
-		if jsonPlain(substr) {
-			f.Contains = append(f.Contains, []byte(substr))
-		}
-		f.Keep = func(r *querylog.Record) bool { return strings.Contains(r.Name, substr) }
-	}
-	page, err := a.qlog.Read(cursor, limit, f)
+	page, err := a.qlog.Read(cursor, limit, queryFilter(rule, substr))
 	if err != nil {
 		return QueryPage{}, err
 	}
 	_, total := a.recent.list(0, "", "")
 	return QueryPage{Queries: page.Records, Total: total, Source: "disk", Next: page.Next}, nil
+}
+
+// queryFilter builds the on-disk filter for a rule and an already-normalized
+// name substring. The raw-byte Contains checks keep the scan cheap, but the
+// decoded record decides: a stored answer (a TXT value, say) can contain text
+// that looks like a rule field, so the prefilter alone must never select a
+// record.
+func queryFilter(rule, substr string) querylog.Filter {
+	var f querylog.Filter
+	if rule != "" {
+		f.Contains = append(f.Contains, []byte(`"rule":`+strconv.Quote(rule)))
+	}
+	if substr != "" && jsonPlain(substr) {
+		f.Contains = append(f.Contains, []byte(substr))
+	}
+	if rule != "" || substr != "" {
+		f.Keep = func(r *querylog.Record) bool {
+			if rule != "" && r.Rule != rule {
+				return false
+			}
+			return substr == "" || strings.Contains(r.Name, substr)
+		}
+	}
+	return f
 }
 
 // memoryCursorPrefix marks a cursor into the in-memory ring: "m<seq>" pages
@@ -386,14 +400,6 @@ type ResolveResult struct {
 	Answers    []AnswerRecord `json:"answers"`
 }
 
-// AnswerRecord is one answer record rendered for display.
-type AnswerRecord struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
-	TTL  uint32 `json:"ttl"`
-	Data string `json:"data"`
-}
-
 // errBadName marks a name that cannot be encoded as a DNS query; callers map
 // it to a 400 response.
 var errBadName = errors.New("not a valid domain name")
@@ -435,58 +441,6 @@ func (a *App) Resolve(ctx context.Context, name string, qtype dnsmessage.Type) (
 	res.Truncated = wire.Truncated(resp)
 	res.Answers = decodeAnswers(resp)
 	return res, nil
-}
-
-// decodeAnswers renders the answer section for display. Record types that are
-// not decoded explicitly are listed with their size and are never dropped.
-func decodeAnswers(resp []byte) []AnswerRecord {
-	out := []AnswerRecord{}
-	var p dnsmessage.Parser
-	if _, err := p.Start(resp); err != nil {
-		return out
-	}
-	if err := p.SkipAllQuestions(); err != nil {
-		return out
-	}
-	for {
-		h, err := p.AnswerHeader()
-		if err != nil {
-			return out
-		}
-		rec := AnswerRecord{Name: domain.Normalize(h.Name.String()), Type: config.QTypeName(h.Type), TTL: h.TTL}
-		switch h.Type {
-		case dnsmessage.TypeA:
-			r, err := p.AResource()
-			if err != nil {
-				return out
-			}
-			rec.Data = netip.AddrFrom4(r.A).String()
-		case dnsmessage.TypeAAAA:
-			r, err := p.AAAAResource()
-			if err != nil {
-				return out
-			}
-			rec.Data = netip.AddrFrom16(r.AAAA).String()
-		case dnsmessage.TypeCNAME:
-			r, err := p.CNAMEResource()
-			if err != nil {
-				return out
-			}
-			rec.Data = domain.Normalize(r.CNAME.String())
-		case dnsmessage.TypeTXT:
-			r, err := p.TXTResource()
-			if err != nil {
-				return out
-			}
-			rec.Data = strings.Join(r.TXT, " ")
-		default:
-			if err := p.SkipAnswer(); err != nil {
-				return out
-			}
-			rec.Data = fmt.Sprintf("%d bytes", h.Length)
-		}
-		out = append(out, rec)
-	}
 }
 
 const (

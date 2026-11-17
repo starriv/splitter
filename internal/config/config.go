@@ -256,12 +256,19 @@ func ParseQType(s string) (dnsmessage.Type, error) {
 	return 0, fmt.Errorf("unknown query type %q", s)
 }
 
+// qtypeNames is the reverse of qtypeCodes, built once for QTypeName.
+var qtypeNames = func() map[dnsmessage.Type]string {
+	m := make(map[dnsmessage.Type]string, len(qtypeCodes))
+	for name, t := range qtypeCodes {
+		m[t] = name
+	}
+	return m
+}()
+
 // QTypeName is the inverse of ParseQType for display.
 func QTypeName(t dnsmessage.Type) string {
-	for k, v := range qtypeCodes {
-		if v == t {
-			return k
-		}
+	if name, ok := qtypeNames[t]; ok {
+		return name
 	}
 	return fmt.Sprint(uint16(t))
 }

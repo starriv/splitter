@@ -50,6 +50,10 @@ func TestQueryLogSurvivesRestart(t *testing.T) {
 	if got := strings.Join(names, " "); got != "example.org/default x.local.example/local-zone www.baidu.com/cn" {
 		t.Fatalf("records after restart: %s", got)
 	}
+	// The answer section survives the JSON Lines round trip too.
+	if a := page.Records[2].Answers; len(a) != 1 || a[0].Type != "A" || a[0].Data != cnAddr.String() {
+		t.Errorf("answers after restart = %+v", a)
+	}
 }
 
 // TestQueryLogUnwritableDirFails verifies that an unusable log directory

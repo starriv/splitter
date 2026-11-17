@@ -337,6 +337,53 @@ function rcodeBadge(rcode, count) {
   return badge(text, tone, tone ? "" : "outline");
 }
 
+// Answer records are stored with each query, so the "结果" column can show
+// what the upstream returned instead of only the RCODE. A failure keeps its
+// RCODE because that is the result; records written before answers were
+// stored say so instead of pretending the query returned nothing.
+const ANSWER_PREVIEW = 2;
+
+function answerTitle(answer) {
+  const ttl = Number.isFinite(answer.ttl) ? `，TTL ${fmt.int(answer.ttl)} 秒` : "";
+  const name = answer.name ? `${answer.name} ` : "";
+  return `${name}${answer.type}${ttl}：${answer.data}`;
+}
+
+// Addresses are self-describing; other records (CNAME, TXT, …) carry their
+// type in front so the value is not mistaken for the address of the name.
+function answerLabel(answer) {
+  const data = answer.data || answer.name || "";
+  return answer.type === "A" || answer.type === "AAAA" || !answer.type ? data : `${answer.type} ${data}`;
+}
+
+function resultCell(record) {
+  const answers = Array.isArray(record.answers) ? record.answers : null;
+  if (record.rcode !== "NOERROR") {
+    return h("div", { class: "chips" }, rcodeBadge(record.rcode), record.truncated ? badge("已截断", "", "outline") : null);
+  }
+  if (answers === null) {
+    return h("div", { class: "chips" },
+      h("span", { class: "badge sm outline", title: "该记录由旧版本写入，没有保存应答区" }, "未记录应答"),
+      record.truncated ? badge("已截断", "", "outline") : null);
+  }
+  if (answers.length === 0) {
+    return h("div", { class: "chips" },
+      h("span", { class: "badge sm outline", title: "NOERROR，但应答区为空（NODATA）" }, "空应答"),
+      record.truncated ? badge("已截断", "", "outline") : null);
+  }
+  const shown = answers.slice(0, ANSWER_PREVIEW);
+  const hidden = answers.slice(ANSWER_PREVIEW);
+  return h("div", { class: "chips" },
+    shown.map((answer) => h("code", { class: "answer", title: answerTitle(answer) }, answerLabel(answer))),
+    hidden.length > 0
+      ? h("span", { class: "badge sm outline", title: hidden.map(answerTitle).join("\n") },
+          `+${hidden.length}${record.answers_truncated ? "…" : ""}`)
+      : record.answers_truncated
+        ? h("span", { class: "badge sm outline", title: "应答记录过长，只保存了前面的内容" }, "…")
+        : null,
+    record.truncated ? badge("已截断", "", "outline") : null);
+}
+
 // ── Status and overview ──────────────────────────────────────────────────────
 function renderStatus(status) {
   const el = $("status");
@@ -996,7 +1043,7 @@ function queryRow(record, compact) {
       h("td", { class: "time", title: fmt.full(at) }, fmt.clock(at)),
       h("td", { class: "name" }, record.type ? h("code", null, record.name || ".") : "没有可读的问题段"),
       h("td", null, ruleBadge(record.rule)),
-      h("td", null, h("div", { class: "chips" }, rcodeBadge(record.rcode), record.truncated ? badge("已截断", "", "outline") : null)),
+      h("td", null, resultCell(record)),
       h("td", { class: "num" }, fmt.ms(record.duration_ms)));
   }
   return h("tr", null,
@@ -1005,7 +1052,7 @@ function queryRow(record, compact) {
     h("td", { class: "nowrap" }, record.class ? `${record.class} ${record.type}` : record.type || "—"),
     h("td", null, ruleBadge(record.rule)),
     h("td", { class: "nowrap", title: how }, h("code", null, record.target)),
-    h("td", null, h("div", { class: "chips" }, rcodeBadge(record.rcode), record.truncated ? badge("已截断", "", "outline") : null)),
+    h("td", null, resultCell(record)),
     h("td", { class: "num" }, fmt.ms(record.duration_ms)));
 }
 
@@ -1047,9 +1094,9 @@ function renderRecentNote(data) {
   const log = view.data && view.data.status.query_log;
   if (data.source === "disk") {
     const where = log ? `查询日志写在 ${log.dir}，${retentionText(log)}。` : "查询日志已落盘。";
-    $("recent-note").textContent = `${where}每页 ${RECENT_LIMIT} 条，最新的在第 1 页。AdGuard 缓存命中的查询不会到达分流器。`;
+    $("recent-note").textContent = `${where}每页 ${RECENT_LIMIT} 条，最新的在第 1 页。AdGuard 缓存命中的查询不会到达分流器。结果列显示上游返回的应答记录，失败时显示 RCODE。`;
   } else {
-    $("recent-note").textContent = `查询日志已关闭（log.query_log.enabled: false），只在内存里保留最近 ${fmt.int(data.capacity)} 条，每页 ${RECENT_LIMIT} 条。AdGuard 缓存命中的查询不会到达分流器。`;
+    $("recent-note").textContent = `查询日志已关闭（log.query_log.enabled: false），只在内存里保留最近 ${fmt.int(data.capacity)} 条，每页 ${RECENT_LIMIT} 条。AdGuard 缓存命中的查询不会到达分流器。结果列显示上游返回的应答记录，失败时显示 RCODE。`;
   }
 }
 
