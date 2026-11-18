@@ -820,20 +820,28 @@ select.input {
 #overview-rules th:nth-child(3),
 #overview-rules td:nth-child(3) { width: 1%; }
 #overview-recent { min-width: 560px; }
+/* The preview shows two answers, so the name gets a stable width instead of
+   collapsing while the result cell takes the remaining space. */
+#overview-recent th:nth-child(2), #overview-recent td:nth-child(2) { width: 13rem; }
 #upstreams .table { min-width: 520px; }
 #sets { min-width: 480px; }
-#recent { min-width: 720px; }
+#recent { min-width: 880px; }
+/* Keep the name readable while the result column shows every answer: without
+   a width the auto layout gives the wide answer cell the space and wraps the
+   domain in the middle of a label. */
+#recent th:nth-child(2), #recent td:nth-child(2) { width: 15rem; }
 #recent td { height: 40px; }
 .chips { display: flex; flex-wrap: wrap; flex-wrap: balance; align-items: center; gap: var(--space-1) var(--space-2); }
 
-/* One answer value in the recent-queries result cell. Long TXT data is cut
-   with an ellipsis; the full value is in the title attribute. */
+/* One answer value in the recent-queries result cell. The full value is shown:
+   long CNAME and TXT data wrap inside the cell, so a row grows instead of
+   hiding records behind an ellipsis. */
 .chips .answer {
   display: inline-block;
-  max-width: 18rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
   vertical-align: middle;
 }
 

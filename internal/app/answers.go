@@ -21,9 +21,9 @@ type AnswerRecord = querylog.Answer
 
 const (
 	// maxRecentAnswers bounds the answer records kept per query. A query log
-	// entry must stay small, and the control page never shows more than a few
-	// values; an upstream answering with hundreds of records (or a large TXT
-	// set) would otherwise inflate every stored line.
+	// entry must stay small: the queries table shows every stored answer, and
+	// an upstream answering with hundreds of records (or a large TXT set)
+	// would otherwise inflate every stored line.
 	maxRecentAnswers = 8
 	// maxAnswerDataBytes bounds one rendered answer. A TXT record can carry
 	// multiple 255-byte strings; longer data is shortened and flagged.

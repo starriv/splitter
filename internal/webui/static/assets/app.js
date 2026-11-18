@@ -341,7 +341,9 @@ function rcodeBadge(rcode, count) {
 // what the upstream returned instead of only the RCODE. A failure keeps its
 // RCODE because that is the result; records written before answers were
 // stored say so instead of pretending the query returned nothing.
-const ANSWER_PREVIEW = 2;
+// Every stored answer is shown, so a CNAME chain or a multi-address reply is
+// readable at a glance. The queries table and the overview preview share this
+// cell; both use the same wrapping layout.
 
 function answerTitle(answer) {
   const ttl = Number.isFinite(answer.ttl) ? `，TTL ${fmt.int(answer.ttl)} 秒` : "";
@@ -371,16 +373,14 @@ function resultCell(record) {
       h("span", { class: "badge sm outline", title: "NOERROR，但应答区为空（NODATA）" }, "空应答"),
       record.truncated ? badge("已截断", "", "outline") : null);
   }
-  const shown = answers.slice(0, ANSWER_PREVIEW);
-  const hidden = answers.slice(ANSWER_PREVIEW);
   return h("div", { class: "chips" },
-    shown.map((answer) => h("code", { class: "answer", title: answerTitle(answer) }, answerLabel(answer))),
-    hidden.length > 0
-      ? h("span", { class: "badge sm outline", title: hidden.map(answerTitle).join("\n") },
-          `+${hidden.length}${record.answers_truncated ? "…" : ""}`)
-      : record.answers_truncated
-        ? h("span", { class: "badge sm outline", title: "应答记录过长，只保存了前面的内容" }, "…")
-        : null,
+    answers.map((answer) => h("code", { class: "answer", title: answerTitle(answer) }, answerLabel(answer))),
+    record.answers_truncated
+      ? h("span", {
+          class: "badge sm outline",
+          title: "应答记录过多或单条数据过长，查询日志只保存了前一部分；完整应答可在「路由诊断」里重新查询",
+        }, "仅存部分")
+      : null,
     record.truncated ? badge("已截断", "", "outline") : null);
 }
 
