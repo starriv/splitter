@@ -30,6 +30,16 @@
 //     tried. Once the penalty expires the server is tried first again; one
 //     success clears its record, one more failure renews the penalty. A
 //     penalized server is still tried when every healthier server failed.
+//   - Identical queries in flight at the same time share one exchange. Two
+//     queries are identical when their bytes match apart from the ID and they
+//     arrive over the same transport, so every flag, EDNS option and the case
+//     of the name match too, and the shared answer is a valid answer to each
+//     caller's query. Only the ID differs, and it is restored per caller.
+//     Nothing is kept after the exchange completes; this is not a cache. The
+//     shared exchange is aborted only when every caller waiting on it has given
+//     up. A panic inside the shared exchange is contained: every caller
+//     receives an error and the failure is counted, so one defective exchange
+//     can neither take the process down nor leave callers waiting forever.
 package upstream
 
 import (
@@ -68,6 +78,13 @@ type Observer interface {
 	// ObservePenalty records that a server was moved behind the healthy
 	// servers (true) or that its failure record was cleared (false).
 	ObservePenalty(group, server string, penalized bool)
+	// ObserveCoalesced records one query that joined an identical query
+	// already in flight instead of starting its own exchange.
+	ObserveCoalesced(group string)
+	// ObservePanic records one panic recovered inside a shared upstream
+	// exchange. The waiters received an error instead of the process going
+	// down.
+	ObservePanic(group string)
 }
 
 // nopObserver discards every observation.
@@ -77,6 +94,8 @@ func (nopObserver) ObserveExchange(string, string, time.Duration, string) {}
 func (nopObserver) ObserveDropped(string, string)                         {}
 func (nopObserver) ObserveRetransmit(string, string)                      {}
 func (nopObserver) ObservePenalty(string, string, bool)                   {}
+func (nopObserver) ObserveCoalesced(string)                               {}
+func (nopObserver) ObservePanic(string)                                   {}
 
 // errMismatch reports a response whose ID or question does not match the query.
 var errMismatch = errors.New("response does not match query")
@@ -103,8 +122,10 @@ type health struct {
 }
 
 // Group is an ordered list of DNS servers that share a per-attempt timeout.
-// Its configuration is immutable after construction; only the per-server
-// failure record changes. A Group may be used concurrently.
+// Its configuration is immutable after construction; the per-server failure
+// record and the in-flight exchange table change as queries run. A Group may be
+// used concurrently. There is no explicit Close: a shared exchange ends when it
+// completes or when its last caller leaves.
 type Group struct {
 	name    string
 	servers []netip.AddrPort
@@ -113,6 +134,31 @@ type Group struct {
 	obs     Observer
 	health  []health
 	now     func() time.Time // replaced in tests
+
+	mu      sync.Mutex
+	flights map[string]*flight // exchanges in progress, by flightKey
+}
+
+// flight is one upstream exchange shared by every identical query that arrives
+// while it is in progress. resp and err are written once by the deferred
+// function in run, before done is closed; waiters is guarded by Group.mu.
+type flight struct {
+	done    chan struct{}
+	resp    []byte
+	err     error
+	waiters int
+	cancel  context.CancelFunc
+}
+
+// flightKey identifies identical queries: the transport followed by the query
+// bytes with the ID zeroed. Everything else that can change the answer (flags,
+// EDNS payload size and options, the case of the name) is part of the bytes.
+func flightKey(req []byte, proto wire.Proto) string {
+	k := make([]byte, 1+len(req))
+	k[0] = byte(proto)
+	copy(k[1:], req)
+	k[1], k[2] = 0, 0
+	return string(k)
 }
 
 // NewGroup returns a group with the given name, ordered servers, and
@@ -127,7 +173,7 @@ func NewGroup(name string, servers []netip.AddrPort, timeout time.Duration, obs 
 		labels[i] = s.String()
 	}
 	return &Group{name: name, servers: servers, labels: labels, timeout: timeout, obs: obs,
-		health: make([]health, len(servers)), now: time.Now}
+		health: make([]health, len(servers)), now: time.Now, flights: map[string]*flight{}}
 }
 
 // Name returns the group name.
@@ -184,10 +230,102 @@ func (g *Group) markFailed(i int) {
 // other than REFUSED; the attempt against each server is limited by the group
 // timeout, and cancellation of ctx aborts the remaining attempts. When every
 // server that answered refused, the last REFUSED answer is returned.
+//
+// A query identical to one already in flight (see flightKey) waits for that
+// exchange instead of starting its own. Cancellation of ctx releases only this
+// caller; the shared exchange is aborted when its last caller has gone.
 func (g *Group) Exchange(ctx context.Context, req []byte, q dnsmessage.Question, proto wire.Proto) ([]byte, error) {
 	if len(req) < wire.HeaderLen {
 		return nil, wire.ErrNoHeader
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	key := flightKey(req, proto)
+	g.mu.Lock()
+	f, joined := g.flights[key]
+	if joined {
+		f.waiters++
+	} else {
+		// The exchange outlives any single caller, so it runs on a context that
+		// keeps ctx's values but is canceled only through f.cancel.
+		fctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		f = &flight{done: make(chan struct{}), waiters: 1, cancel: cancel}
+		g.flights[key] = f
+		// The exchange may still read the query after this caller has returned
+		// and its buffer has been reused, so it works on a private copy.
+		go g.run(fctx, f, key, append([]byte(nil), req...), q, proto)
+	}
+	g.mu.Unlock()
+	// Registered before any observer call so a defective observer cannot leak
+	// this caller's slot in the flight.
+	defer g.leave(key, f)
+	if joined {
+		g.obs.ObserveCoalesced(g.name)
+	}
+
+	select {
+	case <-f.done:
+		if f.err != nil {
+			return nil, f.err
+		}
+		resp := make([]byte, len(f.resp))
+		copy(resp, f.resp)
+		wire.SetID(resp, wire.ID(req))
+		return resp, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// leave records that one caller stopped waiting on f. The last caller out
+// removes the flight and aborts the exchange. The flight is unlisted before
+// the cancel, so a query arriving now starts a fresh exchange instead of
+// joining one that is being aborted.
+func (g *Group) leave(key string, f *flight) {
+	g.mu.Lock()
+	if f.waiters--; f.waiters == 0 {
+		if g.flights[key] == f {
+			delete(g.flights, key)
+		}
+		f.cancel()
+	}
+	g.mu.Unlock()
+}
+
+// run performs the shared exchange of f and publishes its result. A panic in
+// the exchange is recovered here and published as an error, so every caller
+// returns instead of waiting forever on a done channel that is never closed.
+func (g *Group) run(ctx context.Context, f *flight, key string, req []byte, q dnsmessage.Question, proto wire.Proto) {
+	var (
+		resp []byte
+		err  error
+	)
+	defer func() {
+		r := recover()
+		if r != nil {
+			resp, err = nil, fmt.Errorf("panic in upstream exchange: %v", r)
+		}
+		g.mu.Lock()
+		if g.flights[key] == f {
+			delete(g.flights, key)
+		}
+		g.mu.Unlock()
+		f.cancel()
+		f.resp, f.err = resp, err
+		close(f.done)
+		if r != nil {
+			// Reported after the waiters are released: an observer defect must
+			// not be able to keep them from returning.
+			g.obs.ObservePanic(g.name)
+		}
+	}()
+	resp, err = g.exchange(ctx, req, q, proto)
+}
+
+// exchange tries the servers of the group in order for one query; see
+// Exchange.
+func (g *Group) exchange(ctx context.Context, req []byte, q dnsmessage.Question, proto wire.Proto) ([]byte, error) {
 	origID := wire.ID(req)
 	var (
 		errs    []error

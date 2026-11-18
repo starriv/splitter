@@ -670,7 +670,7 @@ func (b *builder) rulesPanel() Panel {
 
 func (b *builder) upstreamPanel() Panel {
 	p := tablePanel(panel("upstream_table", sectionDetail, "上游详情 · 按服务器",
-		"按上游服务器聚合；成功率 = 1 - 失败尝试/总尝试（每次失败尝试都计数，含被下一台救回的）。P95 只统计成功交换；重传 = 半超时未答重发；丢弃 = ID/问题不匹配的迟到或伪造应答。", "count"))
+		"按上游服务器聚合；成功率 = 1 - 失败尝试/总尝试（每次失败尝试都计数，含被下一台救回的）。P95 只统计成功交换；重传 = 半超时未答重发；丢弃 = ID/问题不匹配的迟到或伪造应答。尝试只统计真实交换：相同的在途查询会合并，合并次数见 upstream_coalesced_total。", "count"))
 	srv := b.srv
 	exprs := map[string]string{
 		"attempts": fmt.Sprintf(`sum by (upstream, %s) (increase(splitter_upstream_requests_total[%ds]))`, srv, b.windowSecs),

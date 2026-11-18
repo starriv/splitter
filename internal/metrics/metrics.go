@@ -39,6 +39,8 @@ type Metrics struct {
 	upDropped   *prometheus.CounterVec
 	upRetrans   *prometheus.CounterVec
 	upPenalized *prometheus.GaugeVec
+	upCoalesced *prometheus.CounterVec
+	upPanics    *prometheus.CounterVec
 	snapshot    *snapshotCollector
 	reloads     *prometheus.CounterVec
 	lastReload  prometheus.Gauge
@@ -115,6 +117,12 @@ func New(version, commit string) *Metrics {
 	m.upPenalized = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: ns, Name: "upstream_penalized", Help: "1 while a server is moved behind the healthy servers of its group after consecutive failures, otherwise 0.",
 	}, []string{"upstream", "server"})
+	m.upCoalesced = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "upstream_coalesced_total", Help: "Queries that shared the exchange of an identical query already in flight instead of sending their own.",
+	}, []string{"upstream"})
+	m.upPanics = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "upstream_panics_total", Help: "Panics recovered inside a shared upstream exchange; the query failed instead of taking the process down. Nonzero is a defect.",
+	}, []string{"upstream"})
 	m.snapshot = newSnapshotCollector()
 	m.reloads = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "reloads_total", Help: "Configuration loads by result (the initial load counts).",
@@ -154,7 +162,7 @@ func New(version, commit string) *Metrics {
 	})
 	for _, c := range []prometheus.Collector{
 		m.queries, m.responses, m.duration, m.upRequests, m.upErrors, m.upDuration, m.upDropped, m.upRetrans,
-		m.upPenalized, m.snapshot, m.reloads, m.lastReload, m.reloadOK, m.inflight, m.tcpConns, m.overload, m.writeErrors,
+		m.upPenalized, m.upCoalesced, m.upPanics, m.snapshot, m.reloads, m.lastReload, m.reloadOK, m.inflight, m.tcpConns, m.overload, m.writeErrors,
 		m.malformed, m.panics, m.qlWritten, m.qlDropped, m.qlErrors,
 	} {
 		f(c)
@@ -213,10 +221,25 @@ func (m *Metrics) ObservePenalty(group, server string, penalized bool) {
 	m.upPenalized.WithLabelValues(group, server).Set(v)
 }
 
-// InitUpstream creates the per-server series of a configured upstream at 0, for
-// the same reason the failure counters in New are pre-created. A reload builds
-// new groups with a clean failure record, so the penalty gauge is reset too.
+// ObserveCoalesced implements upstream.Observer and records one query that
+// joined an identical query already in flight.
+func (m *Metrics) ObserveCoalesced(group string) {
+	m.upCoalesced.WithLabelValues(group).Inc()
+}
+
+// ObservePanic implements upstream.Observer and records one panic recovered
+// inside a shared upstream exchange.
+func (m *Metrics) ObservePanic(group string) {
+	m.upPanics.WithLabelValues(group).Inc()
+}
+
+// InitUpstream creates the per-group and per-server series of a configured
+// upstream at 0, for the same reason the failure counters in New are
+// pre-created. A reload builds new groups with a clean failure record, so the
+// penalty gauge is reset too.
 func (m *Metrics) InitUpstream(group string, servers []string) {
+	m.upCoalesced.WithLabelValues(group)
+	m.upPanics.WithLabelValues(group)
 	for _, s := range servers {
 		m.upPenalized.WithLabelValues(group, s).Set(0)
 		m.upRequests.WithLabelValues(group, s)

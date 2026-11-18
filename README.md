@@ -12,6 +12,7 @@ DNS 分流服务。部署在 AdGuard Home 这类前置解析器之后，按域�
 
 - **规则匹配**：支持 `full:`、`domain:`、`keyword:`、`regexp:` 和 `geosite.dat`，自上而下求值，第一条命中的规则生效。
 - **上游回退**：组内服务器按顺序尝试，超时、网络错误或 REFUSED 时换下一台；连续失败 3 次的服务器 30 秒内排到最后。
+- **合并在途查询**：同一上游组内，除 ID 外逐字节相同、传输协议也相同的查询，在前一条还没返回时共用同一次上游交换，各自恢复自己的 ID。交换结束后不保留任何结果，这不是缓存。合并次数计入 `splitter_upstream_coalesced_total`，因此 `upstream_requests_total` 只统计真实交换；交换内部的 panic 会被隔离为该次查询的失败并计入 `splitter_upstream_panics_total`，不会终止进程。
 - **逐字节透传**：转发的应答只恢复 DNS ID，EDNS、DNSSEC 和未知记录类型原样返回。
 - **原子热加载**：新配置和列表全部校验通过才替换，失败时继续用旧配置。
 - **查询日志**：每条查询以 JSON Lines 写入磁盘（含应答记录），写入不阻塞应答；控制面板可以分页回看，并直接显示上游返回的地址、CNAME 等记录。
@@ -153,6 +154,8 @@ observability:
 | --- | --- |
 | `config_last_reload_successful` | 为 0 表示新配置被拒绝 |
 | `upstream_errors_total{reason}`、`upstream_penalized` | 上游失败和被临时排到最后的服务器 |
+| `upstream_coalesced_total` | 合并在途查询省下的上游交换；它解释了 `upstream_requests_total` 与客户端查询数的差值 |
+| `upstream_panics_total` | 非零即缺陷（交换内部 panic 已被隔离，不影响进程） |
 | `set_source_modified_timestamp_seconds` | 列表多久没更新 |
 | `overload_dropped_total` | 达到并发上限后丢弃的查询 |
 | `query_log_dropped_total`、`query_log_write_errors_total` | 没能写入查询日志的记录 |

@@ -39,6 +39,8 @@ func TestFailureSeriesExistAtZero(t *testing.T) {
 		`splitter_upstream_errors_total{reason="network",server="1.1.1.1:53",upstream="abroad"} 0`,
 		`splitter_upstream_errors_total{reason="timeout",server="1.1.1.1:53",upstream="abroad"} 0`,
 		`splitter_upstream_retransmits_total{server="1.1.1.1:53",upstream="abroad"} 0`,
+		`splitter_upstream_coalesced_total{upstream="abroad"} 0`,
+		`splitter_upstream_panics_total{upstream="abroad"} 0`,
 	} {
 		if !strings.Contains(body, s+"\n") {
 			t.Errorf("missing %s", s)
@@ -74,6 +76,26 @@ func TestSnapshotScrape(t *testing.T) {
 	for _, s := range []string{
 		`splitter_set_entries{kind="domain",set="cn"} 3`,
 		`splitter_set_source_modified_timestamp_seconds{file="/etc/splitter/geosite.dat",set="ads"} 1.7e+09`,
+	} {
+		if !strings.Contains(body, s+"\n") {
+			t.Errorf("missing %s", s)
+		}
+	}
+}
+
+// TestUpstreamCoalescedAndPanicCounters verifies that the two per-group
+// upstream counters are exported and that observing them increments the series
+// created by InitUpstream.
+func TestUpstreamCoalescedAndPanicCounters(t *testing.T) {
+	m := New("v", "c")
+	m.InitUpstream("abroad", []string{"1.1.1.1:53"})
+	m.ObserveCoalesced("abroad")
+	m.ObserveCoalesced("abroad")
+	m.ObservePanic("abroad")
+	body := scrape(t, m)
+	for _, s := range []string{
+		`splitter_upstream_coalesced_total{upstream="abroad"} 2`,
+		`splitter_upstream_panics_total{upstream="abroad"} 1`,
 	} {
 		if !strings.Contains(body, s+"\n") {
 			t.Errorf("missing %s", s)

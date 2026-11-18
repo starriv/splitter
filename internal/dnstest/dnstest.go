@@ -2,9 +2,9 @@
 // for tests.
 //
 // Upstream answers queries over UDP and TCP on the same port and can simulate
-// packet loss, forged IDs, truncation and unknown EDNS options, so the
-// resolver transport can be tested without external services. Started
-// resources are released through testing.TB cleanup.
+// packet loss, forged IDs, truncation, unknown EDNS options and delayed
+// replies, so the resolver transport can be tested without external services.
+// Started resources are released through testing.TB cleanup.
 package dnstest
 
 import (
@@ -43,6 +43,9 @@ type Upstream struct {
 	Last atomic.Pointer[[]byte]
 	// LastQuery holds the last query received, before answering.
 	LastQuery atomic.Pointer[[]byte]
+	// Delay holds replies back for this many nanoseconds, over both transports,
+	// so concurrent queries overlap at the upstream.
+	Delay atomic.Int64
 
 	udp *net.UDPConn
 	tcp *net.TCPListener
@@ -146,6 +149,10 @@ func (u *Upstream) serveUDP() {
 			binary.BigEndian.PutUint16(forged, binary.BigEndian.Uint16(forged)+1)
 			_, _ = u.udp.WriteToUDPAddrPort(forged, from)
 		}
+		if d := time.Duration(u.Delay.Load()); d > 0 {
+			time.AfterFunc(d, func() { _, _ = u.udp.WriteToUDPAddrPort(resp, from) })
+			continue
+		}
 		_, _ = u.udp.WriteToUDPAddrPort(resp, from)
 	}
 }
@@ -170,6 +177,9 @@ func (u *Upstream) serveTCP() {
 			clone := append([]byte(nil), req...)
 			u.LastQuery.Store(&clone)
 			resp := u.answer(req, false)
+			if d := time.Duration(u.Delay.Load()); d > 0 {
+				time.Sleep(d)
+			}
 			out := binary.BigEndian.AppendUint16(nil, uint16(len(resp)))
 			_, _ = c.Write(append(out, resp...))
 		}()
