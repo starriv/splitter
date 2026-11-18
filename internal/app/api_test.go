@@ -281,9 +281,23 @@ func TestAPIStateQueryLog(t *testing.T) {
 	e := start(t)
 	h := e.app.AdminHandler()
 	e.ask(t, "udp", "www.baidu.com.", dnsmessage.TypeA)
-	st := decode[State](t, call(t, h, "GET", "/api/v1/state", "", nil)).Status.QueryLog
-	if !st.Enabled || !st.Active || st.Dir != filepath.Join(e.dir, "logs") || st.Files != 1 || st.SizeBytes == 0 ||
-		st.MaxSizeBytes != 4096<<20 || st.MaxAgeSeconds != (30*24*time.Hour).Seconds() || st.Oldest == nil {
+	// Append queues the entry before the reply is sent, but the writer runs in
+	// its own goroutine. Wait for the entry to land instead of racing it: on a
+	// loaded machine the state endpoint can legitimately read the stats before
+	// the first flush.
+	var st QueryLogState
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		st = decode[State](t, call(t, h, "GET", "/api/v1/state", "", nil)).Status.QueryLog
+		if st.SizeBytes > 0 && st.Oldest != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("query log entry never landed: %+v", st)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !st.Enabled || !st.Active || st.Dir != filepath.Join(e.dir, "logs") || st.Files != 1 ||
+		st.MaxSizeBytes != 4096<<20 || st.MaxAgeSeconds != (30*24*time.Hour).Seconds() {
 		t.Errorf("query_log = %+v", st)
 	}
 }
