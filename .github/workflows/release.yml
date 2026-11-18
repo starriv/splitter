@@ -1,16 +1,18 @@
 name: release
 
-# Publishes a release when a v* tag is pushed:
-#   1. runs the full test suite, so every release corresponds to a commit that
-#      passes it;
-#   2. cross-compiles linux/amd64, linux/arm64, darwin/amd64 and darwin/arm64
-#      binaries, generates sha256sums.txt and creates the GitHub Release;
-#   3. builds a linux/amd64 + linux/arm64 image and pushes it to
-#      ghcr.io/<owner>/splitter and, when Docker Hub credentials are configured,
-#      to docker.io. Tags: <version>, <major>.<minor>, <major>, and latest. A
-#      pre-release (a tag containing "-", such as v1.1.0-rc.1) receives only
-#      <version>. After the push, every tag is verified to resolve to the same
-#      image as <version>.
+# Publishes a release when a vX.Y.Z or vX.Y.Z-rc.N tag is pushed:
+#   1. runs the full test suite and rejects any other tag shape, so a tag such
+#      as v1 or v1.0 does not publish;
+#   2. builds a linux/amd64 + linux/arm64 image and pushes it to
+#      ghcr.io/<owner>/splitter and, when both Docker Hub credentials are
+#      configured, to docker.io. Tags: <version>, <major>.<minor>, <major>,
+#      and latest. A pre-release (a tag containing "-", such as v1.1.0-rc.1)
+#      receives only <version>. After the push, every tag is verified to
+#      resolve to the same image as <version>;
+#   3. cross-compiles linux/amd64, linux/arm64, darwin/amd64 and darwin/arm64
+#      binaries, generates sha256sums.txt and creates the GitHub Release.
+#      The release is created only after the image exists, and its notes name
+#      Docker Hub only when both DOCKERHUB_USERNAME and DOCKERHUB_TOKEN are set.
 #
 # Repository configuration for Docker Hub (optional; skipped with a warning when
 # absent):
@@ -38,6 +40,14 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - name: require a semver tag
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! printf '%s\n' "${tag}" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag ${tag} is not a release version (want vX.Y.Z or vX.Y.Z-rc.N)"
+            exit 1
+          fi
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -45,7 +55,7 @@ jobs:
       - run: make test
 
   github-release:
-    needs: test
+    needs: [test, image]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -72,7 +82,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY || format('{0}/splitter', github.repository_owner) }}
-          HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+          HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"

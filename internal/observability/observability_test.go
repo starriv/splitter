@@ -391,3 +391,40 @@ func TestLivePrometheus(t *testing.T) {
 		t.Logf("%-14s %-8s %s %s", p.ID, p.Kind, p.Display, p.Error)
 	}
 }
+
+// TestPrometheusClientDial verifies that the client reaches a loopback server
+// by name, refuses a link-local address, and does not follow redirects.
+func TestPrometheusClientDial(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect" {
+			http.Redirect(w, r, "http://169.254.169.254/", http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	c := prometheusClient(2 * time.Second)
+
+	byName := strings.Replace(srv.URL, "127.0.0.1", "localhost", 1)
+	resp, err := c.Get(byName)
+	if err != nil {
+		t.Fatalf("loopback by name: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://169.254.169.254/", nil)
+	if resp, err := c.Do(req); err == nil || !strings.Contains(err.Error(), "refusing to dial") {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		t.Fatalf("link-local dial: %v", err)
+	}
+
+	resp, err = c.Get(srv.URL + "/redirect")
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("redirect was followed")
+	}
+}

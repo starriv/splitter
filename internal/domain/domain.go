@@ -132,7 +132,7 @@ func ParseRule(s string) (Rule, error) {
 			return Rule{}, fmt.Errorf("%s:%s: %w", kind, s, err)
 		}
 	case KindKeyword:
-		s = strings.ToLower(s)
+		s = asciiLower(s)
 		if s == "" {
 			return Rule{}, errors.New("empty keyword")
 		}

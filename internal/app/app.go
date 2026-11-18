@@ -258,6 +258,46 @@ type App struct {
 	boundListen []netip.AddrPort
 	boundAdmin  netip.AddrPort
 	boundKnown  bool
+
+	// runningLimits and inflight are fixed at startup. A reload does not
+	// rebuild the DNS server, so the console must not present the new numbers
+	// as the ones being enforced.
+	runningLimits config.Limits
+	inflight      chan struct{}
+}
+
+// UseInflight installs the shared in-flight semaphore. The DNS server and
+// POST /api/v1/resolve both take a slot from it. Call it once, before traffic.
+func (a *App) UseInflight(n int) {
+	if n < 1 {
+		n = config.DefaultMaxInflight
+	}
+	a.inflight = make(chan struct{}, n)
+}
+
+// InflightSem returns the semaphore UseInflight created, or nil.
+func (a *App) InflightSem() chan struct{} { return a.inflight }
+
+func (a *App) tryInflight() bool {
+	if a.inflight == nil {
+		return true
+	}
+	select {
+	case a.inflight <- struct{}{}:
+		a.m.Inflight(1)
+		return true
+	default:
+		a.m.Overload("admin")
+		return false
+	}
+}
+
+func (a *App) releaseInflight() {
+	if a.inflight == nil {
+		return
+	}
+	<-a.inflight
+	a.m.Inflight(-1)
 }
 
 // New loads the configuration at path, opens the query log, and returns an
@@ -362,6 +402,12 @@ func (a *App) Reload() error {
 				"running", a.qlogSettings, "config", s)
 		}
 	}
+	if old != nil {
+		retireForwarders(old)
+	}
+	if a.runningLimits.MaxInflight == 0 {
+		a.runningLimits = cfg.Limits
+	}
 	a.level.Set(parseLevel(cfg.Log.Level))
 	a.queryLog.Store(cfg.Log.Queries)
 	a.rt.Store(rt)
@@ -379,9 +425,55 @@ func (a *App) Reload() error {
 		}
 		a.m.InitUpstream(name, labels)
 	}
+	a.m.SyncSeries(ruleNames(rt), upstreamServers(cfg))
 	a.m.Loaded(rt.Sets, rt.Sources)
 	a.log.Info("config loaded", "rules", len(rt.Router.Rules()), "sets", summary(rt.Sets))
 	return nil
+}
+
+// retireForwarders stops groups the new runtime replaced from writing the
+// shared penalty gauges. Several rules can name one group, so each group is
+// retired once. Answer and reject rules have no forwarder.
+func retireForwarders(rt *Runtime) {
+	if rt == nil {
+		return
+	}
+	seen := map[any]struct{}{}
+	for _, rule := range rt.Router.Rules() {
+		r, ok := rule.Forwarder.(interface{ Retire() })
+		if !ok || r == nil {
+			continue
+		}
+		if _, dup := seen[r]; dup {
+			continue
+		}
+		seen[r] = struct{}{}
+		r.Retire()
+	}
+}
+
+// ruleNames returns the configured rule names, in evaluation order.
+func ruleNames(rt *Runtime) []string {
+	rules := rt.Router.Rules()
+	names := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		names = append(names, rule.Name)
+	}
+	return names
+}
+
+// upstreamServers returns each group's server addresses, in try order.
+func upstreamServers(cfg *config.Config) map[string][]string {
+	out := make(map[string][]string, len(cfg.Upstreams))
+	for name, group := range cfg.Upstreams {
+		addrs := group.ServerAddrs()
+		labels := make([]string, len(addrs))
+		for i, addr := range addrs {
+			labels[i] = addr.String()
+		}
+		out[name] = labels
+	}
+	return out
 }
 
 func parseLevel(s string) slog.Level {
@@ -476,7 +568,13 @@ func (a *App) local(q wire.Query, rule string, rc dnsmessage.RCode, ans []dnsmes
 	// never leave the process. The RCODE is recorded in the rcode label, so the
 	// target label keeps a single meaning for every rule.
 	dur := time.Since(start)
-	a.m.ObserveQuery(rule, "reject", "local", wire.RCodeLabel(int(rc)), dur)
+	// _invalid is not a configured reject rule. A separate action keeps
+	// NOTIMP, FORMERR and BADVERS out of the reject series.
+	action := "reject"
+	if rule == invalidRule {
+		action = "invalid"
+	}
+	a.m.ObserveQuery(rule, action, "local", wire.RCodeLabel(int(rc)), dur)
 	if isHealthcheckProbe(q) {
 		return resp
 	}
@@ -571,9 +669,9 @@ func (a *App) health() map[string]any {
 		out["last_reload_ok"] = st.OK
 		out["last_reload_at"] = st.At.UTC().Format(time.RFC3339)
 		if !st.OK {
-			// The previous runtime is still serving, so liveness is unaffected, but
-			// the newest configuration was refused: readiness and /healthz both report
-			// the failure.
+			// The previous runtime is still serving. /healthz stays HTTP 200 and
+			// puts the failure in this body; /readyz uses the same body with HTTP
+			// 503. Docker's health check follows /readyz.
 			out["status"] = "reload_failed"
 			out["last_reload_error"] = st.Err
 		}
@@ -593,6 +691,13 @@ func (a *App) health() map[string]any {
 func (a *App) AdminHandler() http.Handler {
 	mux := a.adminMux()
 	return gzipHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Go fills r.Host from an absolute-form request target and ignores the
+		// Host header. Reject that form so a proxy cannot present a loopback
+		// target with a foreign Host.
+		if r.URL.IsAbs() {
+			writeError(w, http.StatusBadRequest, "absolute-form request targets are not accepted")
+			return
+		}
 		if !a.rt.Load().Config.AdminHostAllowed(r.Host) {
 			writeError(w, http.StatusMisdirectedRequest,
 				fmt.Sprintf("host %q is not an admin address; add it to admin_hosts if a reverse proxy publishes the admin endpoint", r.Host))

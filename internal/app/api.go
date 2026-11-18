@@ -55,31 +55,38 @@ type State struct {
 
 // Status is the status section of the state response.
 type Status struct {
-	Version       string            `json:"version"`
-	Commit        string            `json:"commit"`
-	Now           time.Time         `json:"now"`
-	StartedAt     time.Time         `json:"started_at"`
-	LoadedAt      time.Time         `json:"loaded_at"`
-	Ready         bool              `json:"ready"` // false: the newest config was refused, the previous one is serving
-	LastReload    *ReloadState      `json:"last_reload,omitempty"`
-	Listen        []string          `json:"listen"`
-	Admin         string            `json:"admin"`
-	LogLevel      string            `json:"log_level"`
-	LogQueries    bool              `json:"log_queries"`
-	QueryLog      QueryLogState     `json:"query_log"`
-	MaxInflight   int               `json:"max_inflight"`
-	MaxTCPConns   int               `json:"max_tcp_conns"`
-	Inflight      int               `json:"inflight"`
-	TCPConns      int               `json:"tcp_connections"`
-	Queries       uint64            `json:"queries"`          // answered by a rule
-	Refused       uint64            `json:"refused_locally"`  // non-IN class, bad EDNS version, other opcodes, FORMERR
-	Malformed     uint64            `json:"malformed"`        // could not be parsed
-	Overload      uint64            `json:"overload_dropped"` // dropped at max_inflight / max_tcp_conns
-	WriteErrors   uint64            `json:"write_errors"`
-	Panics        uint64            `json:"panics"`
-	ReloadsOK     uint64            `json:"reloads_ok"`
-	ReloadsFailed uint64            `json:"reloads_failed"`
-	RCodes        map[string]uint64 `json:"rcodes"`
+	Version              string        `json:"version"`
+	Commit               string        `json:"commit"`
+	Now                  time.Time     `json:"now"`
+	StartedAt            time.Time     `json:"started_at"`
+	LoadedAt             time.Time     `json:"loaded_at"`
+	Ready                bool          `json:"ready"` // false: the newest config was refused, the previous one is serving
+	LastReload           *ReloadState  `json:"last_reload,omitempty"`
+	Listen               []string      `json:"listen"`
+	Admin                string        `json:"admin"`
+	LogLevel             string        `json:"log_level"`
+	LogQueries           bool          `json:"log_queries"`
+	QueryLog             QueryLogState `json:"query_log"`
+	MaxInflight          int           `json:"max_inflight"`  // the limit the process is enforcing
+	MaxTCPConns          int           `json:"max_tcp_conns"` // the limit the process is enforcing
+	LimitsPendingRestart bool          `json:"limits_pending_restart"`
+	Inflight             int           `json:"inflight"`
+	TCPConns             int           `json:"tcp_connections"`
+	Queries              uint64        `json:"queries"`          // answered by a configured rule since process start
+	Refused              uint64        `json:"refused_locally"`  // non-IN class, bad EDNS version, other opcodes, FORMERR
+	Malformed            uint64        `json:"malformed"`        // could not be parsed
+	Overload             uint64        `json:"overload_dropped"` // dropped at max_inflight / max_tcp_conns
+	WriteErrors          uint64        `json:"write_errors"`
+	Panics               uint64        `json:"panics"`
+	ReloadsOK            uint64        `json:"reloads_ok"`
+	ReloadsFailed        uint64        `json:"reloads_failed"`
+	// Upstream totals since process start. They keep servers a reload has
+	// removed, so a rate taken from them cannot go backwards.
+	UpstreamRequests  uint64            `json:"upstream_requests"`
+	UpstreamErrors    uint64            `json:"upstream_errors"`
+	UpstreamSucceeded uint64            `json:"upstream_succeeded"`
+	UpstreamSeconds   float64           `json:"upstream_seconds"`
+	RCodes            map[string]uint64 `json:"rcodes"`
 }
 
 // QueryLogState describes the on-disk query log. Settings are those the log
@@ -120,9 +127,13 @@ func (a *App) queryLogState() QueryLogState {
 // records come from the query log and "memory" when they come from the ring.
 // Next is the cursor of the following (older) page, empty on the last page;
 // Capacity is set only for memory.
+//
+// Total is the in-memory ring's lifetime counter: queries recorded since
+// process start. It is not the number of records matching the filter, and a
+// page read from disk uses the same counter.
 type QueryPage struct {
 	Queries  []QueryRecord `json:"queries"`
-	Total    uint64        `json:"total"` // queries recorded since start
+	Total    uint64        `json:"total"`
 	Source   string        `json:"source"`
 	Next     string        `json:"next,omitempty"`
 	Capacity int           `json:"capacity,omitempty"`
@@ -275,16 +286,29 @@ func (a *App) State() State {
 	st := a.m.Stats()
 	version, commit := a.m.BuildInfo()
 
+	// Limits are frozen at the first successful load. A reloaded limits block
+	// is reported as pending so the page does not draw the new ceiling over
+	// the semaphore that is actually enforcing the old one.
+	lim := a.runningLimits
+	if lim.MaxInflight == 0 {
+		lim = cfg.Limits
+	}
+	pendingLimits := lim.MaxInflight != cfg.Limits.MaxInflight ||
+		lim.MaxTCPConns != cfg.Limits.MaxTCPConns ||
+		lim.TCPIdleTimeout != cfg.Limits.TCPIdleTimeout
 	status := Status{
 		Version: version, Commit: commit,
 		Now: time.Now().UTC(), StartedAt: a.started.UTC(), LoadedAt: rt.LoadedAt.UTC(),
 		Ready:    true,
 		LogLevel: cfg.Log.Level, LogQueries: cfg.Log.Queries, QueryLog: a.queryLogState(),
-		MaxInflight: cfg.Limits.MaxInflight, MaxTCPConns: cfg.Limits.MaxTCPConns,
+		MaxInflight: lim.MaxInflight, MaxTCPConns: lim.MaxTCPConns, LimitsPendingRestart: pendingLimits,
 		Inflight: int(st.Inflight), TCPConns: int(st.TCPConns),
+		Queries: st.Business,
 		Refused: st.Rules[invalidRule].Count, Malformed: st.Malformed,
 		Overload: st.Overload, WriteErrors: st.WriteErrors, Panics: st.Panics,
 		ReloadsOK: st.Reloads["success"], ReloadsFailed: st.Reloads["failure"],
+		UpstreamRequests: st.UpAttempts, UpstreamErrors: st.UpErrors,
+		UpstreamSucceeded: st.UpSuccesses, UpstreamSeconds: st.UpSuccessSec,
 		RCodes: st.RCodes,
 	}
 	// Report the bound sockets instead of the configuration: a changed listen
@@ -321,7 +345,6 @@ func (a *App) State() State {
 		for _, s := range cr.Sets {
 			usedBy[s] = append(usedBy[s], r.Name)
 		}
-		status.Queries += rs.Queries
 		out.Rules = append(out.Rules, rs)
 	}
 	out.Status = status
@@ -404,6 +427,11 @@ type ResolveResult struct {
 // it to a 400 response.
 var errBadName = errors.New("not a valid domain name")
 
+// errBusy marks a resolve that could not take an in-flight slot. Callers map
+// it to 429. A nil semaphore (tests that never called UseInflight) does not
+// produce this error.
+var errBusy = errors.New("too many queries in flight")
+
 // Resolve sends one query through the same pipeline a client query follows
 // (routing rules, upstream exchange, metrics, recent ring) and decodes the
 // reply. The query is issued over UDP with EDNS, matching the behaviour of a
@@ -431,6 +459,10 @@ func (a *App) Resolve(ctx context.Context, name string, qtype dnsmessage.Type) (
 	}
 
 	res := ResolveResult{Route: a.Explain(n, qtype), Answers: []AnswerRecord{}}
+	if !a.tryInflight() {
+		return res, errBusy
+	}
+	defer a.releaseInflight()
 	start := time.Now()
 	resp := a.ServeDNS(ctx, req, wire.UDP)
 	res.DurationMS = float64(time.Since(start).Microseconds()) / 1000
@@ -441,6 +473,44 @@ func (a *App) Resolve(ctx context.Context, name string, qtype dnsmessage.Type) (
 	res.Truncated = wire.Truncated(resp)
 	res.Answers = decodeAnswers(resp)
 	return res, nil
+}
+
+// resolveWriteBudget is how long POST /api/v1/resolve may spend writing its
+// response. It covers every server in the slowest group, plus a small margin,
+// and stays inside the admin server's write deadline unless the group needs
+// longer. The ceiling is two minutes.
+func (a *App) resolveWriteBudget() time.Duration {
+	const floor = 30 * time.Second
+	budget := 2 * time.Second
+	if rt := a.Runtime(); rt != nil {
+		for _, group := range rt.Config.Upstreams {
+			n := len(group.ServerAddrs())
+			if n < 1 {
+				n = 1
+			}
+			d := time.Duration(group.Timeout)*time.Duration(n) + 2*time.Second
+			if d > budget {
+				budget = d
+			}
+		}
+	}
+	if budget < floor {
+		budget = floor
+	}
+	if budget > 2*time.Minute {
+		budget = 2 * time.Minute
+	}
+	return budget
+}
+
+// extendWrite replaces the server write deadline for this response. Go arms
+// WriteTimeout before the handler runs, so a long snapshot or resolve would
+// otherwise be cut off at that deadline.
+func extendWrite(w http.ResponseWriter, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(d))
 }
 
 const (
@@ -478,11 +548,15 @@ func (a *App) registerAPI(mux *http.ServeMux) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		// The admin server's write deadline is 30s. The snapshot itself is
+		// bounded at 20s; this keeps the handler from being cut early.
+		extendWrite(w, 25*time.Second)
 		// A nil client (no observability.prometheus_url) reports
 		// configured=false and makes no network request.
 		writeJSON(w, http.StatusOK, a.obs.Load().Snapshot(r.Context(), window, time.Now()))
 	})
 	mux.HandleFunc("POST /api/v1/resolve", guardWrite(func(w http.ResponseWriter, r *http.Request) {
+		extendWrite(w, a.resolveWriteBudget())
 		var body struct {
 			Name string `json:"name"`
 			Type string `json:"type"`
@@ -503,6 +577,8 @@ func (a *App) registerAPI(mux *http.ServeMux) {
 		switch {
 		case errors.Is(err, errBadName):
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("%q is not a valid domain name", body.Name))
+		case errors.Is(err, errBusy):
+			writeError(w, http.StatusTooManyRequests, err.Error())
 		case err != nil:
 			writeError(w, http.StatusBadGateway, err.Error())
 		default:

@@ -574,6 +574,42 @@ func TestReloadRefusesShrunkenSet(t *testing.T) {
 	}
 }
 
+// TestReloadAcceptsRemovedSet verifies that deleting a large set from the
+// configuration is not mistaken for a truncated list. The shrink guard only
+// compares sets that keep their name.
+func TestReloadAcceptsRemovedSet(t *testing.T) {
+	e := start(t)
+	var big strings.Builder
+	for i := range 200 {
+		fmt.Fprintf(&big, "domain:d%d.example.cn\n", i)
+	}
+	writeConfig(t, e.dir, e.cn.Addr, e.ab.Addr, big.String())
+	if err := e.app.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fmt.Sprintf(`
+listen: ["127.0.0.1:0"]
+admin: "127.0.0.1:0"
+log: {dir: logs}
+upstreams:
+  cloudflare: {servers: ["%s"], timeout: 1s}
+sets:
+  local: {rules: ["domain:local.example"]}
+rules:
+  - {name: local-zone, sets: [local], answer: {a: ["192.0.2.10"], ttl: 60}}
+  - {name: default, forward: cloudflare}
+`, e.ab.Addr)
+	if err := os.WriteFile(e.cfg, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.app.Reload(); err != nil {
+		t.Fatalf("removing the cn set was refused: %v", err)
+	}
+	if got := e.app.Explain("d150.example.cn", dnsmessage.TypeA).Rule; got != "default" {
+		t.Errorf("after removing cn, d150.example.cn routes to %q, want default", got)
+	}
+}
+
 // TestMetricsScrapeIsValid verifies that Build never hands the collector two
 // samples with identical labels, even for a configuration the validator did
 // not see, because that fails the whole scrape.

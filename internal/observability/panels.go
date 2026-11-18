@@ -184,6 +184,20 @@ func (b *builder) build() []Panel {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					// One builder must not take the process down. An empty ID
+					// means the panic happened before the panel was filled in.
+					p := panels[i]
+					msg := fmt.Sprintf("panel panicked: %v", r)
+					if p.ID == "" {
+						p = Panel{ID: fmt.Sprintf("panic-%d", i), Kind: "stat", Title: "panel failed", Error: msg}
+					} else if p.Error == "" {
+						p.Error = msg
+					}
+					panels[i] = p
+				}
+			}()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			panels[i] = builders[i]()

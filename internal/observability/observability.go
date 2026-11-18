@@ -21,11 +21,16 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/starriv/splitter/internal/config"
 )
 
 const (
@@ -91,9 +96,45 @@ func New(s Settings) *Client {
 	}
 	return &Client{
 		base:      base,
-		http:      &http.Client{Timeout: s.Timeout},
+		http:      prometheusClient(s.Timeout),
 		job:       s.Job,
 		dashboard: s.DashboardURL,
+	}
+}
+
+// prometheusClient does not follow redirects and does not use HTTP_PROXY.
+// The address check runs on every socket the dialer opens, after name
+// resolution, so a 302 or a DNS change cannot retarget the client at a cloud
+// metadata address. The standard dialer still tries each resolved address in
+// turn (and races IPv4 against IPv6), so "localhost" works whichever family
+// Prometheus listens on.
+func prometheusClient(timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{
+		Timeout: timeout,
+		ControlContext: func(_ context.Context, _, address string, _ syscall.RawConn) error {
+			ap, err := netip.ParseAddrPort(address)
+			if err != nil {
+				return fmt.Errorf("refusing to dial %s: %w", address, err)
+			}
+			if ip := ap.Addr().Unmap(); config.DisallowedDestination(ip) {
+				return fmt.Errorf("refusing to dial %s", ip)
+			}
+			return nil
+		},
+	}
+	transport := &http.Transport{
+		Proxy:               nil,
+		DialContext:         dialer.DialContext,
+		TLSHandshakeTimeout: timeout,
+		IdleConnTimeout:     90 * time.Second,
+		ForceAttemptHTTP2:   true,
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errors.New("redirects are not followed")
+		},
 	}
 }
 

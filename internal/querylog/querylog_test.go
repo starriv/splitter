@@ -48,17 +48,18 @@ func open(t *testing.T, dir string, opts Options) *Log[entry] {
 	return l
 }
 
-// appendN appends n entries and waits until the writer has taken all of them.
+// appendN appends n entries and waits until the writer has handled all of them.
+// Handling means the record is in the buffer or has been counted as lost.
+// The written metric moves only after a successful flush, which Read and
+// Close perform.
 func appendN(t *testing.T, l *Log[entry], from, n int, rule string) {
 	t.Helper()
-	v, _ := observers.Load(l)
-	obs := v.(*countObs)
-	want := obs.written.Load() + obs.errs.Load() + int64(n)
+	want := l.taken.Load() + uint64(n)
 	for i := from; i < from+n; i++ {
 		l.Append(entry{n: i, rule: rule, at: base.Add(time.Duration(i) * time.Second)})
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for obs.written.Load()+obs.errs.Load() < want {
+	for l.taken.Load() < want {
 		if time.Now().After(deadline) {
 			t.Fatal("writer did not write every entry")
 		}

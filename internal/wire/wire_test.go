@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"encoding/binary"
 	"errors"
 	"testing"
 
@@ -195,6 +196,40 @@ func TestClampEDNS(t *testing.T) {
 	}
 	if string(raw[len(raw)-len("cookie"):]) != "cookie" {
 		t.Fatalf("EDNS option data lost: %x", raw)
+	}
+}
+
+// TestTwoOPTIsFormatError verifies RFC 6891: more than one OPT record is a
+// format error, and ClampEDNS still rewrites every OPT it can see.
+func TestTwoOPTIsFormatError(t *testing.T) {
+	raw := pack(t, dnsmessage.Message{Header: dnsmessage.Header{ID: 3},
+		Questions:   []dnsmessage.Question{q("a.cn.", dnsmessage.TypeA)},
+		Additionals: []dnsmessage.Resource{opt(t)}})
+	offs, ok := findOPTs(raw)
+	if !ok || len(offs) != 1 || offs[0] < 1 {
+		t.Fatalf("findOPTs = %v %v", offs, ok)
+	}
+	optBytes := append([]byte(nil), raw[offs[0]-1:]...)
+	two := append(append([]byte(nil), raw...), optBytes...)
+	binary.BigEndian.PutUint16(two[10:12], binary.BigEndian.Uint16(two[10:12])+1)
+	pq, err := ParseQuery(two)
+	if !errors.Is(err, ErrFormat) {
+		t.Fatalf("two OPT records: %v", err)
+	}
+	if !pq.HasQuestion || !pq.EDNS {
+		t.Fatalf("FORMERR reply would lose the question or OPT: question=%v edns=%v", pq.HasQuestion, pq.EDNS)
+	}
+	if !ClampEDNS(two, EDNSPayload) {
+		t.Fatal("ClampEDNS did not see the OPT records")
+	}
+	offs, ok = findOPTs(two)
+	if !ok || len(offs) != 2 {
+		t.Fatalf("after clamp findOPTs = %v %v", offs, ok)
+	}
+	for _, off := range offs {
+		if got := binary.BigEndian.Uint16(two[off+2 : off+4]); got != EDNSPayload {
+			t.Fatalf("OPT at %d payload = %d, want %d", off, got, EDNSPayload)
+		}
 	}
 }
 

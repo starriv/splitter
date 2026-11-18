@@ -123,15 +123,18 @@ type Log[E any] struct {
 	done   chan struct{}
 	closed atomic.Bool
 	once   sync.Once
+	sendMu sync.Mutex // serializes Append with Close so a send cannot land after the drain
 
-	mu      sync.Mutex // guards the fields below
-	f       *os.File
-	bw      *bufio.Writer
-	cur     string    // current segment name, "" when none is open
-	curSize int64     // bytes written to cur, including buffered bytes
-	curAt   time.Time // creation time of cur, from its name
-	retryAt time.Time // after a failure, no new segment is opened before this
-	oldest  struct {
+	mu       sync.Mutex // guards the fields below
+	f        *os.File
+	bw       *bufio.Writer
+	cur      string    // current segment name, "" when none is open
+	curSize  int64     // bytes written to cur, including buffered bytes
+	curAt    time.Time // creation time of cur, from its name
+	retryAt  time.Time // after a failure, no new segment is opened before this
+	pending  int       // records in bw that have not been flushed
+	flushErr error     // most recent flush failure; Close returns it
+	oldest   struct {
 		name string
 		at   time.Time
 	}
@@ -139,6 +142,9 @@ type Log[E any] struct {
 	dropped atomic.Uint64
 	errors  atomic.Uint64
 	lastErr atomic.Pointer[string]
+	// taken counts entries the writer has finished handling. The written
+	// metric waits for a successful flush, so tests wait on this instead.
+	taken atomic.Uint64
 }
 
 // Open creates dir if needed, checks that it is writable by opening the
@@ -179,30 +185,44 @@ func (l *Log[E]) Dir() string { return l.dir }
 // Append queues e for writing. It never blocks: when the queue is full, or
 // after Close, the entry is dropped and counted.
 func (l *Log[E]) Append(e E) {
+	l.sendMu.Lock()
+	defer l.sendMu.Unlock()
 	if l.closed.Load() {
+		l.drop()
 		return
 	}
 	select {
 	case l.ch <- e:
 	default:
-		l.dropped.Add(1)
-		if l.opts.Observer != nil {
-			l.opts.Observer.QueryLogDropped()
-		}
+		l.drop()
+	}
+}
+
+func (l *Log[E]) drop() {
+	l.dropped.Add(1)
+	if l.opts.Observer != nil {
+		l.opts.Observer.QueryLogDropped()
 	}
 }
 
 // Close writes every queued entry, flushes, and closes the current segment.
-// It is safe to call more than once.
+// It is safe to call more than once. A flush that failed earlier is returned
+// so the process log records records that were counted and then lost.
 func (l *Log[E]) Close() error {
 	l.once.Do(func() {
+		l.sendMu.Lock()
 		l.closed.Store(true)
 		close(l.stop)
+		l.sendMu.Unlock()
 	})
 	<-l.done
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.closeFile()
+	err := l.closeFile()
+	if err == nil {
+		err = l.flushErr
+	}
+	return err
 }
 
 func (l *Log[E]) run() {
@@ -249,6 +269,7 @@ func (l *Log[E]) run() {
 
 // write appends one entry. Called with mu held.
 func (l *Log[E]) write(e *E) {
+	defer l.taken.Add(1)
 	rec := l.format(e)
 	rec.Seq = 0
 	line, err := json.Marshal(&rec)
@@ -261,7 +282,7 @@ func (l *Log[E]) write(e *E) {
 		// The last write failed (a full disk, say). Opening a new segment for
 		// every record would litter the directory with empty files; the record
 		// is lost and counted instead, and a new segment is tried shortly.
-		l.lose()
+		l.fail(errors.New("query log write suspended after a failure"))
 		return
 	}
 	if l.f == nil || l.curSize+int64(len(line)) > l.opts.SegmentBytes || time.Since(l.curAt) >= l.rotatePeriod() {
@@ -275,32 +296,65 @@ func (l *Log[E]) write(e *E) {
 		}
 	}
 	if _, err := l.bw.Write(line); err != nil {
-		l.fail(err)
-		// Start a new segment on the next write instead of appending after a
-		// partial line.
-		_ = l.closeFile()
+		l.pending++
+		l.loseBuffered(err)
+		l.abandonFile()
 		return
 	}
+	l.pending++
 	l.curSize += int64(len(line))
-	if l.opts.Observer != nil {
-		l.opts.Observer.QueryLogWritten()
-	}
 }
 
-// fail records a write failure; the caller closes the segment, and the next
-// one is opened after retryAfterFailure. Called with mu held.
+// fail records one record that was never placed in the buffer. Called with mu
+// held. Buffered records are left alone.
 func (l *Log[E]) fail(err error) {
+	l.note(err)
+	l.countErrors(1)
+}
+
+// loseBuffered counts every record still in the buffer as lost. Called with
+// mu held.
+func (l *Log[E]) loseBuffered(err error) {
+	n := l.pending
+	l.pending = 0
+	l.note(err)
+	l.countErrors(n)
+}
+
+func (l *Log[E]) note(err error) {
 	msg := err.Error()
 	l.lastErr.Store(&msg)
 	l.retryAt = time.Now().Add(retryAfterFailure)
-	l.lose()
+	l.flushErr = err
 }
 
-// lose counts a record lost to a failed write.
-func (l *Log[E]) lose() {
-	l.errors.Add(1)
-	if l.opts.Observer != nil {
-		l.opts.Observer.QueryLogWriteError()
+func (l *Log[E]) countErrors(n int) {
+	if n < 1 {
+		n = 1
+	}
+	for range n {
+		l.errors.Add(1)
+		if l.opts.Observer != nil {
+			l.opts.Observer.QueryLogWriteError()
+		}
+	}
+}
+
+// commit counts n records as durable. Called with mu held, after a successful
+// flush of those records.
+func (l *Log[E]) commit(n int) {
+	if n <= 0 {
+		return
+	}
+	l.pending -= n
+	if l.pending < 0 {
+		l.pending = 0
+	}
+	if l.opts.Observer == nil {
+		return
+	}
+	for range n {
+		l.opts.Observer.QueryLogWritten()
 	}
 }
 
@@ -312,14 +366,26 @@ func (l *Log[E]) rotatePeriod() time.Duration {
 }
 
 // flushLocked writes buffered lines to the file. Called with mu held.
+// Records are counted as written only after the flush succeeds. A failed
+// flush counts every record still in the buffer, then drops the segment
+// without flushing it a second time.
 func (l *Log[E]) flushLocked() {
-	if l.bw == nil || l.bw.Buffered() == 0 {
+	if l.bw == nil {
+		return
+	}
+	// bufio flushes on its own once the buffer fills. Those records are already
+	// in the file, so an empty buffer with a pending count is durable too.
+	n := l.pending
+	if l.bw.Buffered() == 0 {
+		l.commit(n)
 		return
 	}
 	if err := l.bw.Flush(); err != nil {
-		l.fail(err)
-		_ = l.closeFile()
+		l.loseBuffered(err)
+		l.abandonFile()
+		return
 	}
+	l.commit(n)
 }
 
 // closeFile flushes and closes the current segment. Called with mu held.
@@ -327,12 +393,33 @@ func (l *Log[E]) closeFile() error {
 	if l.f == nil {
 		return nil
 	}
-	err := l.bw.Flush()
+	var err error
+	if l.bw != nil && (l.bw.Buffered() > 0 || l.pending > 0) {
+		n := l.pending
+		if l.bw.Buffered() == 0 {
+			l.commit(n)
+		} else if ferr := l.bw.Flush(); ferr != nil {
+			l.loseBuffered(ferr)
+			err = ferr
+		} else {
+			l.commit(n)
+		}
+	}
 	if cerr := l.f.Close(); err == nil {
 		err = cerr
 	}
 	l.f, l.bw, l.cur, l.curSize = nil, nil, "", 0
 	return err
+}
+
+// abandonFile closes the segment without writing the buffer. lose has already
+// counted the records. Called with mu held.
+func (l *Log[E]) abandonFile() {
+	if l.f != nil {
+		_ = l.f.Close()
+	}
+	l.f, l.bw, l.cur, l.curSize = nil, nil, "", 0
+	l.pending = 0
 }
 
 // rotate closes the current segment and creates a new one named after at.
@@ -351,7 +438,7 @@ func (l *Log[E]) rotate(at time.Time) error {
 	}
 	for range 8 {
 		name := filePrefix + at.Format(timeLayout) + fileSuffix
-		f, err := os.OpenFile(filepath.Join(l.dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL|os.O_APPEND, 0o640)
+		f, err := os.OpenFile(filepath.Join(l.dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL|os.O_APPEND|oNoFollow, 0o640)
 		if errors.Is(err, os.ErrExist) {
 			at = at.Add(time.Nanosecond)
 			continue
@@ -378,7 +465,7 @@ func (l *Log[E]) openLatest() error {
 		p := filepath.Join(l.dir, name)
 		created, _ := segmentTime(name)
 		if st, err := os.Stat(p); err == nil && st.Size() < l.opts.SegmentBytes && time.Since(created) < l.rotatePeriod() {
-			f, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND, 0)
+			f, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND|oNoFollow, 0)
 			if err != nil {
 				return err
 			}
@@ -395,8 +482,12 @@ func (l *Log[E]) openLatest() error {
 	return l.rotate(time.Now())
 }
 
+func openNoFollow(p string) (*os.File, error) {
+	return os.OpenFile(p, os.O_RDONLY|oNoFollow, 0)
+}
+
 func lastByte(p string, size int64) byte {
-	f, err := os.Open(p)
+	f, err := openNoFollow(p)
 	if err != nil {
 		return 0
 	}
@@ -528,7 +619,7 @@ func (l *Log[E]) firstTime(name string) (time.Time, bool) {
 		return at, true
 	}
 	l.mu.Unlock()
-	f, err := os.Open(filepath.Join(l.dir, name))
+	f, err := openNoFollow(filepath.Join(l.dir, name))
 	if err != nil {
 		return time.Time{}, false
 	}
@@ -639,7 +730,7 @@ func (l *Log[E]) Read(cursor string, limit int, f Filter) (Page, error) {
 // or the scan budget is spent, with next the offset at which to resume.
 func (l *Log[E]) scanSegment(name string, size, end int64, limit int, f *Filter,
 	page *Page, scanned *int64) (next int64, done bool, err error) {
-	file, err := os.Open(filepath.Join(l.dir, name))
+	file, err := openNoFollow(filepath.Join(l.dir, name))
 	if err != nil {
 		return 0, false, err
 	}

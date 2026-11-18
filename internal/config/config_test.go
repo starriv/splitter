@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -321,9 +322,20 @@ func TestObservability(t *testing.T) {
 		{"  prometheus_url: http://prometheus\n  timeout: 500ms\n", "observability.timeout"},
 		{"  prometheus_url: http://prometheus\n  timeout: 2h\n", "observability.timeout"},
 		{"  prometheus_url: http://prometheus\n  unknown: x\n", "field unknown not found"},
+		{"  prometheus_url: http://169.254.169.254/\n", "link-local"},
+		{"  prometheus_url: http://metadata.google.internal/\n", "cloud metadata"},
 	} {
 		if _, err := parse(tc.block); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("block %q: error = %v, want %q", tc.block, err, tc.want)
 		}
+	}
+}
+
+func TestDisallowedDestination(t *testing.T) {
+	if !DisallowedDestination(netip.MustParseAddr("169.254.169.254")) || !DisallowedDestination(netip.MustParseAddr("0.0.0.0")) {
+		t.Fatal("link-local and unspecified addresses must be refused")
+	}
+	if DisallowedDestination(netip.MustParseAddr("127.0.0.1")) || DisallowedDestination(netip.MustParseAddr("10.1.2.3")) {
+		t.Fatal("loopback and private addresses stay allowed")
 	}
 }

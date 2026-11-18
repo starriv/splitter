@@ -710,7 +710,22 @@ func checkHTTPURL(raw string, allowQuery bool) error {
 	if !allowQuery && (u.RawQuery != "" || u.Fragment != "") {
 		return fmt.Errorf("%q: must not carry a query or fragment", raw)
 	}
+	host := u.Hostname()
+	if ip, err := netip.ParseAddr(host); err == nil && DisallowedDestination(ip) {
+		return fmt.Errorf("%q: link-local, multicast and unspecified addresses are not allowed", raw)
+	}
+	if strings.EqualFold(host, "metadata.google.internal") {
+		return fmt.Errorf("%q: cloud metadata hosts are not allowed", raw)
+	}
 	return nil
+}
+
+// DisallowedDestination reports whether ip must not be dialed for a configured
+// HTTP endpoint. Loopback and private addresses stay allowed: Prometheus often
+// runs on the same host or network. Link-local covers cloud metadata
+// (169.254.169.254).
+func DisallowedDestination(ip netip.Addr) bool {
+	return ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
 }
 
 func sortedKeys[V any](m map[string]V) []string {

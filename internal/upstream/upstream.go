@@ -114,11 +114,15 @@ const (
 	udpBufSize = 4096
 )
 
-// health is the failure record of one server. It is updated by concurrent
-// exchanges, so every field is atomic.
+// health is the failure record of one server. fails and downUntil are updated
+// together under mu: separate atomics let a success clear the counter and a
+// failure that already passed the threshold check publish a new deadline
+// afterwards, leaving fails at 0 while the server stays penalized.
 type health struct {
-	fails     atomic.Int32 // consecutive failed attempts
-	downUntil atomic.Int64 // UnixNano until which the server is penalized; 0 = healthy
+	mu        sync.Mutex
+	fails     int32 // consecutive failed attempts
+	downUntil int64 // UnixNano until which the server is penalized; 0 = healthy
+	penalized bool  // upstream_penalized was last set to 1
 }
 
 // Group is an ordered list of DNS servers that share a per-attempt timeout.
@@ -137,6 +141,7 @@ type Group struct {
 
 	mu      sync.Mutex
 	flights map[string]*flight // exchanges in progress, by flightKey
+	retired atomic.Bool        // set when a reload replaces this group
 }
 
 // flight is one upstream exchange shared by every identical query that arrives
@@ -163,7 +168,8 @@ func flightKey(req []byte, proto wire.Proto) string {
 
 // NewGroup returns a group with the given name, ordered servers, and
 // per-attempt timeout. A nil obs is replaced with an observer that discards
-// every event.
+// every event. A group with no servers answers every exchange with an error
+// instead of a nil response.
 func NewGroup(name string, servers []netip.AddrPort, timeout time.Duration, obs Observer) *Group {
 	if obs == nil {
 		obs = nopObserver{}
@@ -176,6 +182,11 @@ func NewGroup(name string, servers []netip.AddrPort, timeout time.Duration, obs 
 		health: make([]health, len(servers)), now: time.Now, flights: map[string]*flight{}}
 }
 
+// Retire stops this group from updating shared penalty gauges. A reload builds
+// a new group for the same names; observations from exchanges still in flight
+// on this one must not mark the replacement healthy or penalized.
+func (g *Group) Retire() { g.retired.Store(true) }
+
 // Name returns the group name.
 func (g *Group) Name() string { return g.name }
 
@@ -184,9 +195,17 @@ func (g *Group) Name() string { return g.name }
 func (g *Group) Servers() []string { return g.labels }
 
 // Penalized reports whether the server at index i is currently moved behind
-// the healthy servers of the group.
+// the healthy servers of the group. An expired penalty is cleared here, including
+// its gauge, so a quiet server does not stay marked after the deadline.
 func (g *Group) Penalized(i int) bool {
-	return g.health[i].downUntil.Load() > g.now().UnixNano()
+	if i < 0 || i >= len(g.health) {
+		return false
+	}
+	h := &g.health[i]
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	g.expireLocked(i, h)
+	return h.downUntil > g.now().UnixNano()
 }
 
 // order returns the server indexes in the order this exchange tries them:
@@ -206,21 +225,60 @@ func (g *Group) order() []int {
 
 func (g *Group) markOK(i int) {
 	h := &g.health[i]
-	if h.fails.Swap(0) >= penaltyThreshold {
-		h.downUntil.Store(0)
-		g.obs.ObservePenalty(g.name, g.labels[i], false)
+	h.mu.Lock()
+	wasPenalized := h.penalized
+	h.fails = 0
+	h.downUntil = 0
+	h.penalized = false
+	h.mu.Unlock()
+	if wasPenalized {
+		g.observePenalty(i, false)
 	}
 }
 
 func (g *Group) markFailed(i int) {
 	h := &g.health[i]
-	if h.fails.Add(1) < penaltyThreshold {
+	h.mu.Lock()
+	h.fails++
+	if h.fails < penaltyThreshold {
+		h.mu.Unlock()
 		return
 	}
-	was := h.downUntil.Swap(g.now().Add(penaltyDuration).UnixNano())
-	if was == 0 {
-		g.obs.ObservePenalty(g.name, g.labels[i], true)
+	already := h.penalized && h.downUntil > g.now().UnixNano()
+	h.downUntil = g.now().Add(penaltyDuration).UnixNano()
+	h.penalized = true
+	h.mu.Unlock()
+	if !already {
+		g.observePenalty(i, true)
+		// Cover the quiet interval after the deadline. Penalized also clears
+		// the gauge on the next lookup; this covers a server nobody asks.
+		time.AfterFunc(penaltyDuration, func() { g.Penalized(i) })
 	}
+}
+
+// expireLocked clears a deadline that is already in the past and reports the
+// gauge change. The caller holds h.mu.
+func (g *Group) expireLocked(i int, h *health) {
+	if h.downUntil == 0 || h.downUntil > g.now().UnixNano() {
+		return
+	}
+	was := h.penalized
+	h.downUntil = 0
+	h.penalized = false
+	if was {
+		// Release the lock before the observer: it must not call back into
+		// the same health record.
+		h.mu.Unlock()
+		g.observePenalty(i, false)
+		h.mu.Lock()
+	}
+}
+
+func (g *Group) observePenalty(i int, penalized bool) {
+	if g.retired.Load() || i < 0 || i >= len(g.labels) {
+		return
+	}
+	g.obs.ObservePenalty(g.name, g.labels[i], penalized)
 }
 
 // Exchange sends req, a complete DNS message whose question is q, and returns
@@ -326,6 +384,9 @@ func (g *Group) run(ctx context.Context, f *flight, key string, req []byte, q dn
 // exchange tries the servers of the group in order for one query; see
 // Exchange.
 func (g *Group) exchange(ctx context.Context, req []byte, q dnsmessage.Question, proto wire.Proto) ([]byte, error) {
+	if len(g.servers) == 0 {
+		return nil, errors.New("upstream: no servers")
+	}
 	origID := wire.ID(req)
 	var (
 		errs    []error

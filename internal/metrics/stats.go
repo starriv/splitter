@@ -9,16 +9,21 @@ import (
 // read back from the same collectors that /metrics exports, so the control page
 // and Prometheus cannot disagree about a number.
 type Stats struct {
-	Rules       map[string]Timing      // by rule name; "_invalid" holds locally refused queries
-	RCodes      map[string]uint64      // responses by RCODE label
-	Servers     map[ServerKey]Upstream // by upstream group and server
-	Reloads     map[string]uint64      // "success" / "failure"
-	Overload    uint64                 // queries dropped at max_inflight or max_tcp_conns, both transports
-	WriteErrors uint64                 // replies built but not delivered, both transports
-	Malformed   uint64                 // queries that could not be parsed
-	Panics      uint64                 // handler panics
-	Inflight    float64                // queries being processed
-	TCPConns    float64                // client TCP connections currently open
+	Rules        map[string]Timing      // by rule name; "_invalid" holds locally refused queries
+	RCodes       map[string]uint64      // responses by RCODE label
+	Servers      map[ServerKey]Upstream // by upstream group and server
+	Reloads      map[string]uint64      // "success" / "failure"
+	Overload     uint64                 // queries dropped at max_inflight or max_tcp_conns, both transports
+	WriteErrors  uint64                 // replies built but not delivered, both transports
+	Malformed    uint64                 // queries that could not be parsed
+	Panics       uint64                 // handler panics
+	Inflight     float64                // queries being processed
+	TCPConns     float64                // client TCP connections currently open
+	Business     uint64                 // queries answered by a configured rule since process start
+	UpAttempts   uint64                 // upstream attempts since process start, including removed servers
+	UpErrors     uint64                 // failed upstream attempts since process start
+	UpSuccesses  uint64                 // successful upstream exchanges since process start
+	UpSuccessSec float64                // sum of successful upstream durations, in seconds
 }
 
 // Timing is a count and the sum of the durations behind it.
@@ -97,6 +102,11 @@ func (m *Metrics) Stats() Stats {
 	each(m.writeErrors, func(_ map[string]string, d *dto.Metric) { s.WriteErrors += count(d) })
 	each(m.malformed, func(_ map[string]string, d *dto.Metric) { s.Malformed = count(d) })
 	each(m.panics, func(_ map[string]string, d *dto.Metric) { s.Panics = count(d) })
+	each(m.business, func(_ map[string]string, d *dto.Metric) { s.Business = count(d) })
+	each(m.upAttempts, func(_ map[string]string, d *dto.Metric) { s.UpAttempts = count(d) })
+	each(m.upAttemptErr, func(_ map[string]string, d *dto.Metric) { s.UpErrors = count(d) })
+	each(m.upSuccesses, func(_ map[string]string, d *dto.Metric) { s.UpSuccesses = count(d) })
+	each(m.upSuccessSec, func(_ map[string]string, d *dto.Metric) { s.UpSuccessSec = float64(d.GetCounter().GetValue()) })
 	each(m.inflight, func(_ map[string]string, d *dto.Metric) { s.Inflight = d.GetGauge().GetValue() })
 	each(m.tcpConns, func(_ map[string]string, d *dto.Metric) { s.TCPConns = d.GetGauge().GetValue() })
 	return s

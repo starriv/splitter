@@ -151,6 +151,57 @@ func TestHealthcheck(t *testing.T) {
 	}
 }
 
+// TestHealthcheckUsesBoundAdmin verifies that the probe trusts the address
+// file written at listen time over a later edit of the config's admin key.
+func TestHealthcheckUsesBoundAdmin(t *testing.T) {
+	dir := t.TempDir()
+	dnsPort, adminPort := freePort(t), freePort(t)
+	p := writeFiles(t, dir, dnsPort, adminPort, "example.cn\n")
+	t.Cleanup(func() {
+		if path, err := boundFilePath(p); err == nil {
+			_ = os.Remove(path)
+		}
+	})
+
+	a, err := app.New(p, slog.New(slog.DiscardHandler), new(slog.LevelVar), metrics.New("t", "t"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := a.Runtime().Config
+	srv := server.New(a, server.Options{})
+	if err := srv.Listen(cfg.ListenAddrs()); err != nil {
+		t.Fatal(err)
+	}
+	srv.Serve()
+	adminLn, err := net.Listen("tcp", cfg.AdminAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin := &http.Server{Handler: a.AdminHandler()}
+	go func() { _ = admin.Serve(adminLn) }()
+	t.Cleanup(func() {
+		_ = admin.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+	if err := writeBoundFile(p, cfg.AdminAddr(), srv.Addrs()); err != nil {
+		t.Fatal(err)
+	}
+
+	closed := freePort(t)
+	writeFiles(t, dir, dnsPort, closed, "example.cn\n")
+	if code := runHealthcheck(p, ""); code != 0 {
+		t.Fatalf("bound admin ignored in favour of the edited config: exit %d", code)
+	}
+	if err := writeBoundFile(p, netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", closed)), srv.Addrs()); err != nil {
+		t.Fatal(err)
+	}
+	if code := runHealthcheck(p, ""); code == 0 {
+		t.Fatal("health check did not use the bound admin address")
+	}
+}
+
 // TestProbeDNSRejectsNonDNS verifies that an echoed query, whose QR bit is
 // clear, is not accepted as a DNS response.
 func TestProbeDNSRejectsNonDNS(t *testing.T) {

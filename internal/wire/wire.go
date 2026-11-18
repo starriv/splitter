@@ -11,7 +11,6 @@
 package wire
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -86,7 +85,13 @@ func ParseQuery(msg []byte) (Query, error) {
 		return Query{}, ErrNoHeader
 	}
 	q := Query{Header: h}
-	if off, ok := findOPT(msg); ok {
+	// RFC 6891: more than one OPT record is a format error. It is reported
+	// after the question is parsed, so the FORMERR reply still echoes the
+	// question and carries an OPT built from the first record.
+	offs, ok := findOPTs(msg)
+	extraOPT := ok && len(offs) > 1
+	if ok && len(offs) > 0 {
+		off := offs[0]
 		q.EDNS = true
 		q.UDPSize = binary.BigEndian.Uint16(msg[off+2:])
 		ttl := binary.BigEndian.Uint32(msg[off+4:])
@@ -104,19 +109,33 @@ func ParseQuery(msg []byte) (Query, error) {
 	} else if !errors.Is(err, dnsmessage.ErrSectionDone) {
 		return q, fmt.Errorf("%w: question: %v", ErrFormat, err)
 	}
+	if extraOPT {
+		return q, fmt.Errorf("%w: more than one OPT record", ErrFormat)
+	}
 	return q, nil
 }
 
 // ednsDoBit is the DNSSEC OK flag in the OPT TTL (RFC 6891 §6.1.4).
 const ednsDoBit = 0x00008000
 
-// findOPT returns the offset of the OPT record's TYPE field in the additional
-// section, walking the message with its own header counts. The walk operates
-// on bytes because it must also work on a message whose question section is
-// malformed.
+// findOPT returns the offset of the first OPT record's TYPE field in the
+// additional section. The walk operates on bytes because it must also work on
+// a message whose question section is malformed. A second OPT is ignored here;
+// ParseQuery rejects it.
 func findOPT(msg []byte) (int, bool) {
-	if len(msg) < HeaderLen {
+	offs, ok := findOPTs(msg)
+	if !ok || len(offs) == 0 {
 		return 0, false
+	}
+	return offs[0], true
+}
+
+// findOPTs returns the TYPE-field offset of every OPT record. ok is false when
+// the message cannot be walked. An empty slice with ok true means there is no
+// OPT record.
+func findOPTs(msg []byte) ([]int, bool) {
+	if len(msg) < HeaderLen {
+		return nil, false
 	}
 	qd := int(binary.BigEndian.Uint16(msg[4:]))
 	an := int(binary.BigEndian.Uint16(msg[6:]))
@@ -126,29 +145,30 @@ func findOPT(msg []byte) (int, bool) {
 	for i := 0; i < qd; i++ {
 		var ok bool
 		if off, ok = skipName(msg, off); !ok || off+4 > len(msg) {
-			return 0, false
+			return nil, false
 		}
 		off += 4
 	}
 	for i := 0; i < an+ns; i++ {
 		var ok bool
 		if off, ok = skipRR(msg, off); !ok {
-			return 0, false
+			return nil, false
 		}
 	}
+	var opts []int
 	for i := 0; i < ar; i++ {
 		nameEnd, ok := skipName(msg, off)
 		if !ok || nameEnd+10 > len(msg) {
-			return 0, false
+			return nil, false
 		}
 		if dnsmessage.Type(binary.BigEndian.Uint16(msg[nameEnd:])) == dnsmessage.TypeOPT {
-			return nameEnd, true
+			opts = append(opts, nameEnd)
 		}
 		if off, ok = skipRR(msg, off); !ok {
-			return 0, false
+			return nil, false
 		}
 	}
-	return 0, false
+	return opts, true
 }
 
 // skipName advances past a (possibly compressed) domain name.
@@ -189,12 +209,17 @@ func skipRR(msg []byte, off int) (int, bool) {
 // to at most max. Only the CLASS field changes; every EDNS option is preserved
 // byte for byte. It reports whether the message carried an OPT record.
 func ClampEDNS(msg []byte, max uint16) bool {
-	off, ok := findOPT(msg)
-	if !ok || off+4 > len(msg) {
+	offs, ok := findOPTs(msg)
+	if !ok || len(offs) == 0 {
 		return false
 	}
-	if cur := binary.BigEndian.Uint16(msg[off+2:]); cur > max {
-		binary.BigEndian.PutUint16(msg[off+2:], max)
+	for _, off := range offs {
+		if off+4 > len(msg) {
+			continue
+		}
+		if cur := binary.BigEndian.Uint16(msg[off+2:]); cur > max {
+			binary.BigEndian.PutUint16(msg[off+2:], max)
+		}
 	}
 	return true
 }
@@ -235,7 +260,29 @@ func ResponseMatches(resp []byte, id uint16, q dnsmessage.Question) bool {
 		return false
 	}
 	return rq.Type == q.Type && rq.Class == q.Class &&
-		bytes.EqualFold(rq.Name.Data[:rq.Name.Length], q.Name.Data[:q.Name.Length])
+		asciiEqualFold(rq.Name.Data[:rq.Name.Length], q.Name.Data[:q.Name.Length])
+}
+
+// asciiEqualFold compares DNS names. DNS case-insensitivity is ASCII A–Z only,
+// and the names must be the same length. bytes.EqualFold applies Unicode
+// case-folding and can match different lengths.
+func asciiEqualFold(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		ca, cb := a[i], b[i]
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
 }
 
 // Reply builds a response to q. answers may be nil (NODATA or an error RCODE).

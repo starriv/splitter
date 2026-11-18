@@ -545,16 +545,15 @@ function renderAlerts() {
 }
 
 function upstreamTotals(data) {
-  const total = { requests: 0, errors: 0, succeeded: 0, seconds: 0 };
-  for (const group of data.upstreams) {
-    for (const server of group.servers) {
-      total.requests += server.requests;
-      total.succeeded += server.succeeded;
-      total.seconds += server.duration_seconds;
-      for (const n of Object.values(server.errors)) total.errors += n;
-    }
-  }
-  return total;
+  // Process-lifetime counters. Summing the servers currently configured drops
+  // a server a reload removed and makes the rate run backwards.
+  const status = data.status || {};
+  return {
+    requests: status.upstream_requests || 0,
+    errors: status.upstream_errors || 0,
+    succeeded: status.upstream_succeeded || 0,
+    seconds: status.upstream_seconds || 0,
+  };
 }
 
 function pushSample(data) {
@@ -619,6 +618,7 @@ function renderKPIs(data) {
     setValue("kpi-qps", oneDecimal.format((last.queries - first.queries) / span), "qps");
     setCardNote("kpi-qps", `近 ${Math.round(span)} 秒平均，正在处理 ${fmt.int(status.inflight)} 条`);
   } else {
+    setValue("kpi-qps", "—");
     setCardNote("kpi-qps", "需要至少两次状态采样");
   }
 
@@ -658,17 +658,18 @@ function renderKPIs(data) {
 
   const overload = status.overload_dropped || 0;
   const overloadNote = overload > 0 ? `；已因并发或连接上限丢弃 ${fmt.int(overload)} 条` : "";
+  const pendingNote = status.limits_pending_restart ? "；配置里的新上限要重启后才生效" : "";
 
   const inMax = status.max_inflight || 0;
   const inRatio = inMax > 0 ? status.inflight / inMax : 0;
   setValue("kpi-inflight", fmt.int(status.inflight));
-  setCardNote("kpi-inflight", `上限 ${fmt.int(inMax)} · 当前占用 ${fmt.percent(inRatio)}${overloadNote}`);
+  setCardNote("kpi-inflight", `上限 ${fmt.int(inMax)} · 当前占用 ${fmt.percent(inRatio)}${overloadNote}${pendingNote}`);
   setProgress("kpi-inflight-meter", status.inflight, inMax, `${fmt.int(status.inflight)} / ${fmt.int(inMax)}`, inRatio);
 
   const tcpMax = status.max_tcp_conns || 0;
   const tcpRatio = tcpMax > 0 ? status.tcp_connections / tcpMax : 0;
   setValue("kpi-tcp", fmt.int(status.tcp_connections));
-  setCardNote("kpi-tcp", `上限 ${fmt.int(tcpMax)} · 当前占用 ${fmt.percent(tcpRatio)}${overloadNote}`);
+  setCardNote("kpi-tcp", `上限 ${fmt.int(tcpMax)} · 当前占用 ${fmt.percent(tcpRatio)}${overloadNote}${pendingNote}`);
   setProgress("kpi-tcp-meter", status.tcp_connections, tcpMax, `${fmt.int(status.tcp_connections)} / ${fmt.int(tcpMax)}`, tcpRatio);
 }
 
@@ -1013,25 +1014,42 @@ function render() {
 }
 
 let stateFetch = null;
+let stateGeneration = 0;
 
-function refreshState() {
-  // Deduplicate overlapping polls; callers that await this get the in-flight
-  // request instead of starting a second one.
-  if (stateFetch) return stateFetch;
-  stateFetch = (async () => {
-    const signal = typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(10000) : undefined;
+function refreshState(force) {
+  // A forced refresh (after reload, or after a resolve the user just ran)
+  // starts a new request and ignores a poll that was already in flight.
+  // Otherwise overlapping polls share one request.
+  if (force) stateGeneration += 1;
+  else if (stateFetch) return stateFetch;
+  const generation = stateGeneration;
+  if (stateFetch && stateFetch.abort) stateFetch.abort.abort();
+  const controller = new AbortController();
+  const timeout = typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(10000) : null;
+  const signal = timeout && typeof AbortSignal.any === "function"
+    ? AbortSignal.any([controller.signal, timeout])
+    : controller.signal;
+  const request = (async () => {
     try {
-      const data = await api("/api/v1/state", { signal, priority: "low" });
+      const data = await api("/api/v1/state", { signal, priority: force ? "high" : "low" });
+      if (generation !== stateGeneration) return;
       view.data = data;
       view.connectionError = "";
       pushSample(data);
     } catch (error) {
+      if (generation !== stateGeneration) return;
       if (error.name === "TimeoutError") view.connectionError = "读取状态超时";
       else if (error.name !== "AbortError") view.connectionError = error.message;
     }
+    if (generation !== stateGeneration) return;
     render();
-  })().finally(() => { stateFetch = null; });
-  return stateFetch;
+  })();
+  const tracked = request.finally(() => {
+    if (stateFetch === tracked) stateFetch = null;
+  });
+  tracked.abort = controller;
+  stateFetch = tracked;
+  return tracked;
 }
 
 // ── Recent queries ───────────────────────────────────────────────────────────
@@ -1138,8 +1156,12 @@ function renderPager(error) {
   const more = Boolean(pager.next);
   $("recent-pager").hidden = pager.page === 1 && !more;
   $("p-page").textContent = `第 ${fmt.int(pager.page)} 页`;
-  $("p-first").hidden = pager.page <= 2;
-  setPageLink($("p-first"), pager.page > 2 ? 1 : 0);
+  // Hiding a focused link moves focus to <body> in Chrome, and the check
+  // inside setPageLink then no longer sees the link. Move focus first.
+  const first = $("p-first");
+  if (pager.page <= 2 && document.activeElement === first) $("p-page").focus();
+  first.hidden = pager.page <= 2;
+  setPageLink(first, pager.page > 2 ? 1 : 0);
   setPageLink($("p-prev"), pager.page - 1);
   setPageLink($("p-next"), more ? pager.page + 1 : 0);
   let text = error || "";
@@ -1152,7 +1174,7 @@ function renderPager(error) {
   $("recent-progress").textContent = text;
 }
 
-async function refreshRecent() {
+async function refreshRecent(force) {
   // The overview preview always wants the newest page; the queries view wants
   // the page it is on.
   const onQueries = currentView === "queries";
@@ -1161,9 +1183,9 @@ async function refreshRecent() {
   const key = query.toString();
   const generation = pager.generation;
   // Polling the same page must not abort its own in-flight request; a page or
-  // filter change does supersede the previous one.
+  // filter change, or a resolve the user just ran, does supersede it.
   if (recentInFlight) {
-    if (recentInFlight.key === key && recentInFlight.generation === generation) return;
+    if (!force && recentInFlight.key === key && recentInFlight.generation === generation) return;
     recentInFlight.controller.abort();
   }
   const controller = new AbortController();
@@ -1248,7 +1270,9 @@ function restorePager(search) {
   pager.generation++;
   const page = Number.parseInt(search.get("page") || "", 10);
   const cursor = search.get("cursor") || "";
-  if (!(page > 1) || !cursor) {
+  // new Array(page) throws once page is large enough. A shared link with a
+  // huge page must land on page 1 instead of breaking startup.
+  if (!(page > 1) || page > 10000 || !Number.isSafeInteger(page) || !cursor) {
     resetPager();
     return;
   }
@@ -1287,6 +1311,10 @@ const OBS_SECTIONS = [
   { id: "runtime", title: "运行与集合" },
 ];
 const OBS_RANGE_LABEL = { "1h": "1 小时", "3h": "3 小时", "6h": "6 小时", "12h": "12 小时", "24h": "24 小时", "3d": "3 天", "7d": "7 天" };
+
+function rangeText(value) {
+  return OBS_RANGE_LABEL[value] || value;
+}
 const OBS_UNIT_LABEL = { reqps: "qps", percent: "%", ms: "ms" };
 const OBS_RANGE_RE = /^\d+(?:s|m|h|d|w)$/;
 const CHART_HEIGHT = 240;
@@ -1299,6 +1327,7 @@ const obs = {
   error: "",          // the most recent fetch failed at the network/HTTP level
   data: null,         // the most recent successful snapshot
   fetchedAt: 0,       // when the last successful snapshot arrived
+  dataRange: "",      // range whose panels are on screen; stays put while stale
   stale: false,       // showing older panels while Prometheus is unreachable
   generation: 0,      // discards responses to a superseded request
   nodes: new Map(),   // panel id → { el, update }
@@ -1473,7 +1502,11 @@ function updateObsControls() {
   } else {
     link.hidden = true;
   }
-  const parts = [`范围 ${OBS_RANGE_LABEL[obs.range] || obs.range}`];
+  const shownRange = obs.stale && obs.dataRange ? obs.dataRange : obs.range;
+  const parts = [`范围 ${rangeText(shownRange)}`];
+  if (obs.stale && obs.dataRange && obs.dataRange !== obs.range) {
+    parts.push(`图上仍是 ${rangeText(obs.dataRange)}`);
+  }
   if (info && info.configured) {
     if (!info.reachable) parts.push("Prometheus 不可达");
     else if (obs.paused) parts.push("自动刷新已暂停");
@@ -1526,11 +1559,12 @@ function renderObservability() {
     notice.replaceChildren(obsSetupCard());
     return;
   }
+  const frozen = obs.stale && obs.dataRange ? `图上仍是 ${rangeText(obs.dataRange)} 的数据。` : "";
   if (obs.error) {
-    notice.replaceChildren(obsNoticeCard("danger", "读取可观测性数据失败", obs.error));
+    notice.replaceChildren(obsNoticeCard("danger", "读取可观测性数据失败", `${obs.error}${frozen ? ` ${frozen}` : ""}`));
   } else if (!info.reachable) {
     notice.replaceChildren(obsNoticeCard("danger", "Prometheus 不可达",
-      `${info.error || "请求失败"}\n\n地址：${info.url || "未配置"}${info.job ? ` · job：${info.job}` : ""}\n页面保留上一次的数据；每 30 秒自动重试。`));
+      `${info.error || "请求失败"}\n\n地址：${info.url || "未配置"}${info.job ? ` · job：${info.job}` : ""}\n${frozen || "页面保留上一次的数据。"}每 30 秒自动重试。`));
   } else {
     notice.replaceChildren();
   }
@@ -1546,7 +1580,7 @@ function renderObservability() {
 
 function renderObsPanels(data) {
   const host = $("obs-panels");
-  const signature = data.panels.map((panel) => panel.id).join(",");
+  const signature = data.panels.map((panel) => `${panel.id}:${panel.kind}`).join(",");
   if (host.dataset.structure !== signature) {
     resetChartObserver();
     obs.nodes.clear();
@@ -1574,7 +1608,14 @@ function renderObsPanels(data) {
     }
     host.replaceChildren(...ordered);
     for (const panel of data.panels) {
-      const node = createObsPanel(panel);
+      let node;
+      try {
+        node = createObsPanel(panel);
+      } catch (error) {
+        const el = h("article", { class: "card obs-stat", "data-panel": panel.id },
+          h("p", { class: "empty-note" }, `这个面板没能显示：${error.message}`));
+        node = { el, update() {} };
+      }
       obs.nodes.set(panel.id, node);
       const grid = targets.get(panel.id);
       if (grid) grid.append(node.el);
@@ -1583,7 +1624,14 @@ function renderObsPanels(data) {
   }
   for (const panel of data.panels) {
     const node = obs.nodes.get(panel.id);
-    if (node) node.update(panel, data);
+    if (!node) continue;
+    try {
+      node.update(panel, data);
+    } catch (error) {
+      const note = node.el.querySelector(".panel-error") || h("p", { class: "empty-note panel-error" });
+      note.textContent = `这个面板没能更新：${error.message}`;
+      if (!note.isConnected) node.el.append(note);
+    }
   }
 }
 
@@ -1628,15 +1676,21 @@ function createObsTable(panel) {
     el,
     update(next) {
       caption.textContent = next.title;
-      thead.replaceChildren(h("tr", null, ...next.columns.map((column) =>
+      const columns = next.columns || [];
+      if (next.error && !columns.length) {
+        thead.replaceChildren();
+        tbody.replaceChildren(h("tr", null, h("td", { class: "empty" }, next.error)));
+        return;
+      }
+      thead.replaceChildren(h("tr", null, ...columns.map((column) =>
         h("th", { scope: "col", class: column.numeric ? "num" : null }, column.title))));
       if (!next.rows || !next.rows.length) {
-        tbody.replaceChildren(h("tr", null, h("td", { colspan: next.columns.length, class: "empty" },
+        tbody.replaceChildren(h("tr", null, h("td", { colspan: Math.max(columns.length, 1), class: "empty" },
           next.error || "所选区间没有数据。")));
         return;
       }
       tbody.replaceChildren(...next.rows.map((row) => {
-        const cells = next.columns.slice(1).map((column) => {
+        const cells = columns.slice(1).map((column) => {
           const cell = row.cells[column.key] || {};
           const text = cell.text !== undefined ? cell.text : formatObsValue(cell.value, column.unit, column.decimals);
           return h("td", { class: `${column.numeric ? "num" : ""} ${cell.tone ? `tone-${cell.tone}` : ""}`.trim() }, text);
@@ -1650,7 +1704,7 @@ function createObsTable(panel) {
 function createObsChart(panel) {
   const title = h("h3", { class: "panel-title" }, panel.title);
   const help = helpDetails(panel.description);
-  const plot = h("div", { class: "chart-plot" });
+  const plot = h("div", { class: "chart-plot", tabindex: "0", role: "group", "aria-label": `${panel.title}，方向键查看各时间点` });
   const svg = svgEl("svg", { class: "chart-svg", role: "img", focusable: "false" });
   const tip = h("div", { class: "chart-tip", "aria-hidden": "true" });
   tip.hidden = true;
@@ -1663,10 +1717,10 @@ function createObsChart(panel) {
   });
   const el = h("figure", { class: "panel chart", "data-panel": panel.id },
     h("figcaption", { class: "chart-head" }, title, help), plot, legend, details);
-  const state = { panel, snap: null, hidden: new Set(), layout: null, hoverLine: null, suspended: false, visibilityBound: false, dirtyData: true };
+  const state = { panel, snap: null, hidden: new Set(), layout: null, hoverLine: null, hoverIndex: -1, suspended: false, visibilityBound: false, dirtyData: true };
 
-  const visibleSeries = () => state.panel.series.filter((series) => !state.hidden.has(series.name));
-  const pointCount = () => (state.panel.series.length ? state.panel.series[0].values.length : 0);
+  const visibleSeries = () => (state.panel.series || []).filter((series) => !state.hidden.has(series.name));
+  const pointCount = () => (state.panel.series && state.panel.series.length ? state.panel.series[0].values.length : 0);
 
   function draw() {
     const snap = state.snap;
@@ -1678,10 +1732,12 @@ function createObsChart(panel) {
     svg.setAttribute("viewBox", `0 0 ${width} ${CHART_HEIGHT}`);
     svg.setAttribute("width", String(width));
     svg.setAttribute("height", String(CHART_HEIGHT));
+    const keepHover = state.hoverIndex;
     svg.replaceChildren();
     state.layout = null;
     state.hoverLine = null;
     tip.hidden = true;
+    tip.setAttribute("aria-hidden", "true");
 
     const n = pointCount();
     const visible = visibleSeries();
@@ -1718,6 +1774,7 @@ function createObsChart(panel) {
         : visible.length ? "这段时间没有数据" : "未选择任何系列";
       svg.append(svgEl("text", { x: width / 2, y: CHART_HEIGHT / 2, "text-anchor": "middle", class: "chart-empty" }, empty));
       svg.setAttribute("aria-label", `${state.panel.title}：没有数据`);
+      state.hoverIndex = -1;
       return;
     }
 
@@ -1771,6 +1828,7 @@ function createObsChart(panel) {
     state.layout = { l, r, t, b, pw, ph, width, n, x, y, snap };
     const latest = visible.map((series) => `${series.name} ${formatObsValue(latestValue(series.values), state.panel.unit)}`);
     svg.setAttribute("aria-label", `${state.panel.title}：${visible.length} 条曲线。${latest.slice(0, 4).join("；")}`);
+    if (keepHover >= 0 && keepHover < n) showIndex(keepHover);
   }
 
   function pointerIndex(clientX) {
@@ -1785,22 +1843,27 @@ function createObsChart(panel) {
   }
 
   function hideTip() {
+    state.hoverIndex = -1;
     if (state.hoverLine) state.hoverLine.setAttribute("visibility", "hidden");
     tip.hidden = true;
+    tip.setAttribute("aria-hidden", "true");
   }
 
-  function showTip(event) {
-    const i = pointerIndex(event.clientX);
-    if (i < 0) {
+  function showIndex(i) {
+    const layout = state.layout;
+    if (!layout || i < 0 || i >= layout.n) {
       hideTip();
       return;
     }
-    const layout = state.layout;
+    state.hoverIndex = i;
     const xx = layout.x(i);
-    state.hoverLine.setAttribute("x1", xx);
-    state.hoverLine.setAttribute("x2", xx);
-    state.hoverLine.setAttribute("visibility", "visible");
+    if (state.hoverLine) {
+      state.hoverLine.setAttribute("x1", xx);
+      state.hoverLine.setAttribute("x2", xx);
+      state.hoverLine.setAttribute("visibility", "visible");
+    }
     const at = new Date(layout.snap.start_ms + i * layout.snap.step_ms);
+    const rows = visibleSeries().map((series) => `${series.name} ${formatObsValue(series.values[i], state.panel.unit)}`);
     tip.replaceChildren(
       h("p", { class: "tip-time" }, fmt.full(at)),
       ...visibleSeries().map((series) => h("div", { class: `tip-row c-${series.color}` },
@@ -1809,18 +1872,48 @@ function createObsChart(panel) {
         h("span", { class: "tip-value" }, formatObsValue(series.values[i], state.panel.unit)))),
     );
     tip.hidden = false;
+    tip.setAttribute("aria-hidden", "false");
     const plotRect = plot.getBoundingClientRect();
-    const rel = event.clientX - plotRect.left;
+    const svgRect = svg.getBoundingClientRect();
+    const scale = svgRect.width && layout.width ? svgRect.width / layout.width : 1;
+    const rel = svgRect.left - plotRect.left + xx * scale;
     const tipWidth = tip.offsetWidth;
     let left = rel + 12;
     if (left + tipWidth > plotRect.width - 4) left = rel - tipWidth - 12;
     tip.style.left = `${Math.max(4, left)}px`;
     tip.style.top = "4px";
+    plot.setAttribute("aria-label", `${state.panel.title}，${fmt.full(at)}。${rows.join("，")}`);
+  }
+
+  function showTip(event) {
+    showIndex(pointerIndex(event.clientX));
   }
 
   plot.addEventListener("pointermove", (event) => showTip(event));
   plot.addEventListener("pointerdown", (event) => showTip(event));
-  plot.addEventListener("pointerleave", hideTip);
+  plot.addEventListener("pointerleave", () => {
+    if (document.activeElement === plot) return;
+    hideTip();
+  });
+  plot.addEventListener("focus", () => {
+    if (state.hoverIndex < 0 && state.layout) showIndex(state.layout.n - 1);
+  });
+  plot.addEventListener("keydown", (event) => {
+    const n = state.layout ? state.layout.n : 0;
+    if (!n) return;
+    let i = state.hoverIndex;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") i = Math.min(n - 1, i < 0 ? 0 : i + 1);
+    else if (event.key === "ArrowLeft" || event.key === "ArrowUp") i = Math.max(0, i < 0 ? 0 : i - 1);
+    else if (event.key === "Home") i = 0;
+    else if (event.key === "End") i = n - 1;
+    else if (event.key === "Escape") {
+      hideTip();
+      return;
+    } else return;
+    event.preventDefault();
+    showIndex(i);
+  });
+  plot.addEventListener("blur", () => hideTip());
 
   // The legend is rebuilt only when the set of series changes. A refresh with
   // the same series updates the values in place, so a focused legend button
@@ -1829,6 +1922,7 @@ function createObsChart(panel) {
   let legendSignature = "";
 
   function renderLegend() {
+    if (!state.panel.series) state.panel.series = [];
     const many = state.panel.series.length > 8;
     legend.dataset.many = String(many);
     legend.tabIndex = many ? 0 : -1;
@@ -1915,12 +2009,12 @@ function createObsChart(panel) {
   return {
     el,
     update(next, snap) {
-      state.panel = next;
+      state.panel = { ...next, series: next.series || [] };
       state.snap = snap;
-      title.textContent = next.title;
-      el.toggleAttribute("data-error", Boolean(next.error));
+      title.textContent = state.panel.title;
+      el.toggleAttribute("data-error", Boolean(state.panel.error));
       const helpText = help.querySelector("p");
-      if (helpText) helpText.textContent = next.description || "";
+      if (helpText) helpText.textContent = state.panel.description || "";
       if (!state.visibilityBound) {
         const section = el.closest(".obs-section");
         if (section) {
@@ -2039,12 +2133,14 @@ async function refreshObservability(manual = false) {
     });
     if (generation !== obs.generation) return;
     if (data.prometheus.configured && !data.prometheus.reachable && obs.data && obs.data.panels.length) {
-      // Keep the last panels visible, but say why they are frozen.
+      // Keep the last panels visible, but say why they are frozen. dataRange
+      // stays on the window those panels were loaded for.
       obs.data = { ...obs.data, prometheus: data.prometheus };
       obs.stale = true;
     } else {
       obs.data = data;
       obs.stale = false;
+      obs.dataRange = range;
       if (!data.prometheus.configured || data.prometheus.reachable) obs.fetchedAt = Date.now();
     }
     obs.error = "";
@@ -2165,8 +2261,8 @@ async function diagnose(resolve) {
           : h("p", { class: "result-note" }, resolved.truncated
             ? "应答被截断（TC），没有带回记录；真实客户端会改走 TCP 重试。"
             : "应答里没有记录。"));
-      refreshState();
-      if (!view.paused) refreshRecent();
+      refreshState(true);
+      refreshRecent(true);
     } else {
       const route = await api(`/api/v1/route?${new URLSearchParams({ name, type })}`);
       result.replaceChildren(resultGrid(route, null), h("p", { class: "result-note" }, "只是按当前规则推演，没有发出查询。"));
@@ -2212,7 +2308,7 @@ async function reloadConfig() {
     button.removeAttribute("aria-busy");
     $("reload-label").textContent = "重新加载配置";
   }
-  await refreshState();
+  await refreshState(true);
   // A reload can enable, disable or repoint observability.prometheus_url.
   if (currentView === "observability") refreshObservability(true);
 }
@@ -2388,6 +2484,7 @@ function start() {
     const next = viewFromLocation();
     applyView(next);
     render();
+    resetViewScroll();
     if (next === "overview" || next === "queries") refreshRecent();
     if (next === "observability") enterObservability();
     if (next === "diagnose" && $("d-name").value.trim()) diagnose(false);
@@ -2445,7 +2542,7 @@ function start() {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;
     refreshState();
-    if (!view.paused) refreshRecent();
+    if (!view.paused && (currentView === "overview" || (currentView === "queries" && pager.page === 1))) refreshRecent();
     if (!obs.paused && currentView === "observability") refreshObservability();
   });
 }

@@ -61,6 +61,10 @@ type Options struct {
 	TCPIdleTimeout time.Duration // idle time before a client TCP connection is closed
 	Logger         *slog.Logger  // logger for server events; nil discards them
 	Observer       Observer      // telemetry receiver; nil disables telemetry
+	// Sem is the shared in-flight semaphore. Nil means New creates one of
+	// size MaxInflight. The admin resolve path takes slots from the same
+	// channel when the process wires one in.
+	Sem chan struct{}
 }
 
 // Server owns the bound listeners, the concurrency limits, and the lifecycle of
@@ -108,8 +112,12 @@ func New(h Handler, opt Options) *Server {
 		opt.Observer = nopObserver{}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	sem := opt.Sem
+	if sem == nil {
+		sem = make(chan struct{}, opt.MaxInflight)
+	}
 	return &Server{
-		h: h, opt: opt, sem: make(chan struct{}, opt.MaxInflight), cns: make(chan struct{}, opt.MaxTCPConns),
+		h: h, opt: opt, sem: sem, cns: make(chan struct{}, opt.MaxTCPConns),
 		log: opt.Logger, obs: opt.Observer, ctx: ctx, cancel: cancel,
 		conns: map[net.Conn]struct{}{},
 	}
@@ -262,7 +270,7 @@ func (s *Server) releaseConn() {
 // single packet that triggers a defect must cost one answer, not the resolver
 // process. ok is false after a panic: nothing is sent, and a TCP connection is
 // closed because its stream position can no longer be trusted.
-func (s *Server) handle(req []byte, proto wire.Proto) (resp []byte, ok bool) {
+func (s *Server) handle(ctx context.Context, req []byte, proto wire.Proto) (resp []byte, ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.obs.Panic()
@@ -271,7 +279,7 @@ func (s *Server) handle(req []byte, proto wire.Proto) (resp []byte, ok bool) {
 			resp, ok = nil, false
 		}
 	}()
-	return s.h.ServeDNS(s.ctx, req, proto), true
+	return s.h.ServeDNS(ctx, req, proto), true
 }
 
 func (s *Server) serveUDP(c *net.UDPConn) {
@@ -296,7 +304,7 @@ func (s *Server) serveUDP(c *net.UDPConn) {
 		go func() {
 			defer s.wg.Done()
 			defer s.release()
-			if resp, _ := s.handle(req, wire.UDP); resp != nil {
+			if resp, _ := s.handle(s.ctx, req, wire.UDP); resp != nil {
 				if _, err := c.WriteToUDPAddrPort(resp, from); err != nil && !errors.Is(err, net.ErrClosed) {
 					// A reply that does not reach the client is counted; an
 					// answer that exceeds the path MTU fails at this point.
@@ -372,7 +380,7 @@ func (s *Server) serveConn(c *net.TCPConn) {
 		if !s.acquire("tcp") {
 			return
 		}
-		resp, ok := s.handle(req, wire.TCP)
+		resp, ok := s.handle(s.ctx, req, wire.TCP)
 		s.release()
 		if !ok {
 			return

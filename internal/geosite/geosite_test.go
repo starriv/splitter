@@ -130,6 +130,43 @@ func FuzzLoad(f *testing.F) {
 	})
 }
 
+// TestAttributeFalseIsAbsent verifies that an attribute with bool_value false
+// does not satisfy @attr. Official lists only emit true; a false value is
+// still treated as absent. A missing bool continues to count as present.
+func TestAttributeFalseIsAbsent(t *testing.T) {
+	var attr []byte
+	attr = protowire.AppendTag(attr, 1, protowire.BytesType)
+	attr = protowire.AppendString(attr, "ads")
+	attr = protowire.AppendTag(attr, 2, protowire.VarintType)
+	attr = protowire.AppendVarint(attr, 0)
+	var domainMsg []byte
+	domainMsg = protowire.AppendTag(domainMsg, 1, protowire.VarintType)
+	domainMsg = protowire.AppendVarint(domainMsg, 2)
+	domainMsg = protowire.AppendTag(domainMsg, 2, protowire.BytesType)
+	domainMsg = protowire.AppendString(domainMsg, "ads.example")
+	domainMsg = protowire.AppendTag(domainMsg, 3, protowire.BytesType)
+	domainMsg = protowire.AppendBytes(domainMsg, attr)
+	var site []byte
+	site = protowire.AppendTag(site, 1, protowire.BytesType)
+	site = protowire.AppendString(site, "CN")
+	site = protowire.AppendTag(site, 2, protowire.BytesType)
+	site = protowire.AppendBytes(site, domainMsg)
+	var data []byte
+	data = protowire.AppendTag(data, 1, protowire.BytesType)
+	data = protowire.AppendBytes(data, site)
+
+	if _, err := Load(data, sel(t, "cn@ads"), func(domain.Rule) error { return nil }); err == nil {
+		t.Fatal("bool_value false satisfied @ads")
+	}
+	var got []string
+	if _, err := Load(data, sel(t, "cn"), func(r domain.Rule) error {
+		got = append(got, r.String())
+		return nil
+	}); err != nil || strings.Join(got, " ") != "domain:ads.example" {
+		t.Fatalf("entry kept without the attribute: %v %v", got, err)
+	}
+}
+
 // TestZeroMatchSelectorFails protects the rejection of a selector whose
 // attribute filter matches no entry. Such a selector usually indicates a
 // misspelled attribute name, and accepting it would silently reduce the

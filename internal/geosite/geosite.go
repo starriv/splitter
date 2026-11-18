@@ -239,11 +239,13 @@ func parseDomain(b []byte) (domain.Rule, []string, error) {
 				value = string(v)
 				break
 			}
-			key, err := attributeKey(v)
+			key, include, err := attributeKey(v)
 			if err != nil {
 				return domain.Rule{}, nil, err
 			}
-			attrs = append(attrs, strings.ToLower(key))
+			if include {
+				attrs = append(attrs, strings.ToLower(key))
+			}
 		default:
 			n := protowire.ConsumeFieldValue(num, wt, b)
 			if n < 0 {
@@ -260,18 +262,43 @@ func parseDomain(b []byte) (domain.Rule, []string, error) {
 	return r, attrs, err
 }
 
-// attributeKey returns the key of an Attribute message and rejects an attribute
-// that carries none, because such an attribute can never satisfy a selector.
-func attributeKey(b []byte) (string, error) {
+// attributeKey returns the key of an Attribute message and whether it is
+// present. An attribute with no key is rejected. A bool value of false is not
+// present: selectors match on the key, and a false value must not satisfy
+// @attr. Official lists only emit true; a false value is still honored.
+func attributeKey(b []byte) (string, bool, error) {
 	var key string
-	err := eachField(b, func(num protowire.Number, v []byte) error {
-		if num == 1 {
-			key = string(v)
+	include := true
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return "", false, protowire.ParseError(n)
 		}
-		return nil
-	})
-	if err == nil && key == "" {
-		err = errors.New("attribute without key")
+		b = b[n:]
+		switch {
+		case num == 1 && typ == protowire.BytesType:
+			v, n := protowire.ConsumeBytes(b)
+			if n < 0 {
+				return "", false, protowire.ParseError(n)
+			}
+			key, b = string(v), b[n:]
+		case num == 2 && typ == protowire.VarintType:
+			value, n := protowire.ConsumeVarint(b)
+			if n < 0 {
+				return "", false, protowire.ParseError(n)
+			}
+			include = value != 0
+			b = b[n:]
+		default:
+			n = protowire.ConsumeFieldValue(num, typ, b)
+			if n < 0 {
+				return "", false, protowire.ParseError(n)
+			}
+			b = b[n:]
+		}
 	}
-	return key, err
+	if key == "" {
+		return "", false, errors.New("attribute without key")
+	}
+	return key, include, nil
 }

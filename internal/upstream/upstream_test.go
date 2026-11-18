@@ -310,8 +310,8 @@ func TestFailingServerPenalized(t *testing.T) {
 		t.Errorf("penalized server still tried first: exchange took %s", d)
 	}
 
-	// After the penalty the black hole is tried first again; one more failure
-	// renews the penalty without a second observation.
+	// Expiry clears the gauge. The black hole is tried first again, and that
+	// failure renews the penalty, which emits penalized once more.
 	now = now.Add(penaltyDuration + time.Second)
 	if g.Penalized(0) {
 		t.Fatal("penalty did not expire")
@@ -323,8 +323,8 @@ func TestFailingServerPenalized(t *testing.T) {
 	if got := rec.reasons[before:]; len(got) != 2 || got[0] != "timeout" {
 		t.Errorf("reasons after expiry = %q, want [timeout, \"\"]", got)
 	}
-	if !g.Penalized(0) || len(rec.penalties) != 1 {
-		t.Errorf("penalty not renewed: penalized=%v observations=%v", g.Penalized(0), rec.penalties)
+	if !g.Penalized(0) || len(rec.penalties) != 3 || rec.penalties[1] || !rec.penalties[2] {
+		t.Errorf("penalty not renewed: penalized=%v observations=%v, want [true false true]", g.Penalized(0), rec.penalties)
 	}
 }
 
@@ -346,11 +346,58 @@ func TestPenaltyClearedBySuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	check(t, resp, up.A)
-	if g.Penalized(0) || g.health[0].fails.Load() != 0 {
+	g.health[0].mu.Lock()
+	fails := g.health[0].fails
+	g.health[0].mu.Unlock()
+	if g.Penalized(0) || fails != 0 {
 		t.Error("success did not clear the failure record")
 	}
 	if len(rec.penalties) != 2 || rec.penalties[1] {
 		t.Errorf("penalty observations = %v, want [true false]", rec.penalties)
+	}
+}
+
+// TestEmptyGroupErrors verifies that a group with no servers returns an error
+// instead of a nil response the caller would then treat as a message.
+func TestEmptyGroupErrors(t *testing.T) {
+	g := NewGroup("g", nil, time.Second, nil)
+	req, q := query(t, "example.org.")
+	resp, err := g.Exchange(context.Background(), req, q, wire.UDP)
+	if err == nil || resp != nil {
+		t.Fatalf("empty group: resp=%v err=%v", resp, err)
+	}
+}
+
+// TestPenaltyFieldsStayConsistent verifies that overlapping success and
+// failure updates cannot leave a server with a clear failure count and a
+// penalty that is still in the future.
+func TestPenaltyFieldsStayConsistent(t *testing.T) {
+	g := NewGroup("g", []netip.AddrPort{netip.MustParseAddrPort("10.0.0.1:53")}, time.Second, nil)
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for range penaltyThreshold {
+				g.markFailed(0)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			g.markOK(0)
+		}()
+		wg.Wait()
+		h := &g.health[0]
+		h.mu.Lock()
+		fails, until, penalized := h.fails, h.downUntil, h.penalized
+		h.mu.Unlock()
+		future := until > g.now().UnixNano()
+		if fails == 0 && future {
+			t.Fatalf("fails=0 with downUntil still in the future")
+		}
+		if penalized != future {
+			t.Fatalf("penalized=%v downUntil future=%v fails=%d", penalized, future, fails)
+		}
 	}
 }
 

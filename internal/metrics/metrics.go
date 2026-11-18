@@ -10,6 +10,7 @@ package metrics
 import (
 	"net/http"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,6 +34,7 @@ type Metrics struct {
 	queries     *prometheus.CounterVec
 	responses   *prometheus.CounterVec
 	duration    *prometheus.HistogramVec
+	business    prometheus.Counter // queries whose rule is not _invalid; never deleted
 	upRequests  *prometheus.CounterVec
 	upErrors    *prometheus.CounterVec
 	upDuration  *prometheus.HistogramVec
@@ -41,6 +43,17 @@ type Metrics struct {
 	upPenalized *prometheus.GaugeVec
 	upCoalesced *prometheus.CounterVec
 	upPanics    *prometheus.CounterVec
+	// Lifetime upstream totals. Per-server series are removed when a reload
+	// drops that server; these are not, so a rate taken from the admin API
+	// cannot go backwards.
+	upAttempts   prometheus.Counter
+	upAttemptErr prometheus.Counter
+	upSuccesses  prometheus.Counter
+	upSuccessSec prometheus.Counter
+
+	seriesMu    sync.Mutex
+	seenRules   map[string]struct{}
+	seenServers map[string]map[string]struct{} // upstream → server addresses
 	snapshot    *snapshotCollector
 	reloads     *prometheus.CounterVec
 	lastReload  prometheus.Gauge
@@ -99,6 +112,9 @@ func New(version, commit string) *Metrics {
 	m.duration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: ns, Name: "request_duration_seconds", Help: "Time from receiving a query to having its response, by rule.", Buckets: buckets,
 	}, []string{"rule"})
+	m.business = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: ns, Name: "business_queries_total", Help: "Queries answered by a configured rule since process start. Excludes _invalid. The series is not removed when a rule is renamed.",
+	})
 	m.upRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "upstream_requests_total", Help: "Exchanges attempted with each upstream server.",
 	}, []string{"upstream", "server"})
@@ -123,6 +139,18 @@ func New(version, commit string) *Metrics {
 	m.upPanics = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "upstream_panics_total", Help: "Panics recovered inside a shared upstream exchange; the query failed instead of taking the process down. Nonzero is a defect.",
 	}, []string{"upstream"})
+	m.upAttempts = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: ns, Name: "upstream_attempts_total", Help: "Upstream exchange attempts since process start, across every server that has ever been configured.",
+	})
+	m.upAttemptErr = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: ns, Name: "upstream_attempt_errors_total", Help: "Failed upstream exchange attempts since process start, across every server that has ever been configured.",
+	})
+	m.upSuccesses = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: ns, Name: "upstream_successes_total", Help: "Successful upstream exchanges since process start, across every server that has ever been configured.",
+	})
+	m.upSuccessSec = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: ns, Name: "upstream_success_seconds_total", Help: "Sum of successful upstream exchange durations in seconds, since process start.",
+	})
 	m.snapshot = newSnapshotCollector()
 	m.reloads = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "reloads_total", Help: "Configuration loads by result (the initial load counts).",
@@ -161,8 +189,9 @@ func New(version, commit string) *Metrics {
 		Namespace: ns, Name: "query_log_write_errors_total", Help: "Query log write failures plus records lost while writing is suspended after a failure (disk full, permissions); those records are not on disk.",
 	})
 	for _, c := range []prometheus.Collector{
-		m.queries, m.responses, m.duration, m.upRequests, m.upErrors, m.upDuration, m.upDropped, m.upRetrans,
-		m.upPenalized, m.upCoalesced, m.upPanics, m.snapshot, m.reloads, m.lastReload, m.reloadOK, m.inflight, m.tcpConns, m.overload, m.writeErrors,
+		m.queries, m.responses, m.duration, m.business, m.upRequests, m.upErrors, m.upDuration, m.upDropped, m.upRetrans,
+		m.upPenalized, m.upCoalesced, m.upPanics, m.upAttempts, m.upAttemptErr, m.upSuccesses, m.upSuccessSec,
+		m.snapshot, m.reloads, m.lastReload, m.reloadOK, m.inflight, m.tcpConns, m.overload, m.writeErrors,
 		m.malformed, m.panics, m.qlWritten, m.qlDropped, m.qlErrors,
 	} {
 		f(c)
@@ -173,9 +202,11 @@ func New(version, commit string) *Metrics {
 	for _, r := range []string{"success", "failure"} {
 		m.reloads.WithLabelValues(r)
 	}
-	for _, p := range []string{"udp", "tcp"} {
+	for _, p := range []string{"udp", "tcp", "admin"} {
 		m.overload.WithLabelValues(p)
-		m.writeErrors.WithLabelValues(p)
+		if p != "admin" {
+			m.writeErrors.WithLabelValues(p)
+		}
 	}
 	return m
 }
@@ -192,11 +223,15 @@ func (m *Metrics) Registry() *prometheus.Registry { return m.reg }
 // exchange attempt.
 func (m *Metrics) ObserveExchange(group, server string, d time.Duration, reason string) {
 	m.upRequests.WithLabelValues(group, server).Inc()
+	m.upAttempts.Inc()
 	if reason != "" {
 		m.upErrors.WithLabelValues(group, server, reason).Inc()
+		m.upAttemptErr.Inc()
 		return
 	}
 	m.upDuration.WithLabelValues(group, server).Observe(d.Seconds())
+	m.upSuccesses.Inc()
+	m.upSuccessSec.Add(d.Seconds())
 }
 
 // ObserveDropped implements upstream.Observer and records one discarded UDP
@@ -260,6 +295,65 @@ func (m *Metrics) ObserveQuery(rule, action, target, rcode string, d time.Durati
 	m.queries.WithLabelValues(rule, action, target).Inc()
 	m.responses.WithLabelValues(rcode).Inc()
 	m.duration.WithLabelValues(rule).Observe(d.Seconds())
+	if rule != "_invalid" {
+		m.business.Inc()
+	}
+}
+
+// SyncSeries drops Prometheus series for rules and upstream servers that the
+// running configuration no longer names, and remembers the sets it was given.
+// Lifetime counters (business queries, upstream attempt totals) are left in
+// place. Call it after the new groups have been installed and the previous
+// groups have been retired, so a late observation from the old groups cannot
+// recreate a penalty gauge that this reset just cleared.
+func (m *Metrics) SyncSeries(rules []string, groups map[string][]string) {
+	m.seriesMu.Lock()
+	defer m.seriesMu.Unlock()
+	wantRules := map[string]struct{}{"_invalid": {}}
+	for _, rule := range rules {
+		wantRules[rule] = struct{}{}
+	}
+	for rule := range m.seenRules {
+		if _, ok := wantRules[rule]; ok {
+			continue
+		}
+		m.queries.DeletePartialMatch(prometheus.Labels{"rule": rule})
+		m.duration.DeleteLabelValues(rule)
+	}
+	m.seenRules = wantRules
+
+	wantGroups := map[string]map[string]struct{}{}
+	for group, servers := range groups {
+		set := map[string]struct{}{}
+		for _, server := range servers {
+			set[server] = struct{}{}
+		}
+		wantGroups[group] = set
+	}
+	for group, servers := range m.seenServers {
+		want := wantGroups[group]
+		if want == nil {
+			m.upCoalesced.DeleteLabelValues(group)
+			m.upPanics.DeleteLabelValues(group)
+		}
+		for server := range servers {
+			if _, ok := want[server]; ok {
+				continue
+			}
+			m.deleteServer(group, server)
+		}
+	}
+	m.seenServers = wantGroups
+}
+
+// deleteServer removes every per-server series. The caller holds seriesMu.
+func (m *Metrics) deleteServer(group, server string) {
+	m.upRequests.DeleteLabelValues(group, server)
+	m.upErrors.DeletePartialMatch(prometheus.Labels{"upstream": group, "server": server})
+	m.upDuration.DeleteLabelValues(group, server)
+	m.upDropped.DeleteLabelValues(group, server)
+	m.upRetrans.DeleteLabelValues(group, server)
+	m.upPenalized.DeleteLabelValues(group, server)
 }
 
 // QueryLogWritten implements querylog.Observer.
